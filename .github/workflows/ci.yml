@@ -35,6 +35,8 @@ jobs:
         run: npm test
       - name: Test (Windows, bounded ACL helper concurrency)
         if: runner.os == 'Windows'
+        env:
+          CODEX_ROUTER_WINDOWS_PRIVATE_SYNC_TIMEOUT_MS: 45000
         # Private-file tests launch real PowerShell ACL helpers. Avoid starving
         # their existing deadlines on shared runners; retain every test and
         # all within-file request/race concurrency assertions.
@@ -101,7 +103,7 @@ jobs:
       - name: Set up Homebrew
         id: set-up-homebrew
         if: steps.changed.outputs.run == 'true'
-        uses: Homebrew/actions/setup-homebrew@eb02c69dbabdb66ff183c614f4ce7ab3c077592c # 2026.10.12.1
+        uses: Homebrew/actions/setup-homebrew@d482da0e602890d3160aade42e72c8556103bf04 # 2026.10.26.1
       - name: Cache Homebrew Bundler RubyGems
         id: cache-homebrew-gems
         if: steps.changed.outputs.run == 'true'
@@ -130,7 +132,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set up Homebrew
-        uses: Homebrew/actions/setup-homebrew@eb02c69dbabdb66ff183c614f4ce7ab3c077592c # 2026.10.12.1
+        uses: Homebrew/actions/setup-homebrew@d482da0e602890d3160aade42e72c8556103bf04 # 2026.10.26.1
       - name: Build and test the formula from source
         run: packaging/homebrew/check-core-readiness.sh --install
 
@@ -399,18 +401,31 @@ jobs:
           set -euo pipefail
           app="$RUNNER_TEMP/Codex Router.app"
           outer="$app/Contents/MacOS/ModelRouterTray"
-          embedded="$app/Contents/Resources/Control Center.app/Contents/MacOS/Codex Router"
           log="$RUNNER_TEMP/model-router-macos-smoke.log"
 
           query_lifecycle() {
-            node -e '
-              const { execFileSync } = require("node:child_process");
-              const env = { ...process.env };
-              delete env.ELECTRON_RUN_AS_NODE;
-              process.stdout.write(execFileSync(process.argv[1], ["--query-lifecycle"], {
-                env, encoding: "utf8", timeout: 10000, killSignal: "SIGKILL",
-              }));
-            ' "$embedded"
+            # A GUI query helper registers as this same macOS application. If
+            # it overlaps NSWorkspace.openApplication, LaunchServices can fail
+            # the real window launch. Observe the existing record without
+            # starting another application, using the exact same validator.
+            node scripts/query-control-center-lifecycle.mjs
+          }
+
+          diagnose_app_launch() {
+            /usr/bin/osascript -l JavaScript -e '
+              ObjC.import("AppKit");
+              const result = [];
+              for (const identifier of ["io.github.codex-router.tray", "io.github.codex-router.control-center"]) {
+                const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(identifier);
+                for (let index = 0; index < apps.count; index += 1) {
+                  const app = apps.objectAtIndex(index);
+                  result.push({ identifier, pid: Number(app.processIdentifier),
+                    finishedLaunching: Boolean(app.isFinishedLaunching),
+                    terminated: Boolean(app.isTerminated), bundlePath: app.bundleURL.path.js });
+                }
+              }
+              JSON.stringify(result);
+            ' >&2 || true
           }
 
           wait_for_lifecycle() {
@@ -420,6 +435,7 @@ jobs:
             last_state=
             for _ in {1..120}; do
               if ! last_state=$(query_lifecycle); then
+                diagnose_app_launch
                 cat "$log" >&2 || true
                 return 1
               fi
@@ -444,6 +460,7 @@ jobs:
             done
             printf 'Timed out waiting for Control Center lifecycle %s/%s/%s; last state: %s\n' \
               "$expected_running" "$expected_ready" "$expected_visible" "$last_state" >&2
+            diagnose_app_launch
             cat "$log" >&2 || true
             return 1
           }

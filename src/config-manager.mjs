@@ -3,10 +3,8 @@ import { randomBytes } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
-  renameSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -22,10 +20,11 @@ import {
   isManagedCodexBaseUrl,
   redactCallerUrl,
 } from "./caller-auth.mjs";
-import { CODEX_PATCH_HOOK_BASE_PATH } from "./codex-patch-hook-endpoint.mjs";
+import { CODEX_PATCH_CAPABILITY_PATHS } from "./codex-patch-hook-endpoint.mjs";
 import {
   privateFileIsProtected,
   protectPrivateFile,
+  writePrivateFile,
 } from "./file-security.mjs";
 import {
   refreshCodexCallerCapabilityContents,
@@ -81,7 +80,6 @@ const standaloneWebSearchStartMarker =
   "# BEGIN codex-router-standalone-web-search-managed";
 const standaloneWebSearchEndMarker =
   "# END codex-router-standalone-web-search-managed";
-const createdAgentsTableMarker = "# codex-router-created-agents-table";
 const managedAgentMaxConcurrency = 6;
 // Codex 0.147 records a child's FINAL_ANSWER as subAgentActivity
 // `interacted` and keeps that child visually working for the whole live
@@ -163,9 +161,10 @@ function configuredRouterBaseUrl() {
   // Keep an explicitly activated client capability during repair, catalog
   // refresh, port migration and caller-key rotation. Fresh installs stay /v1.
   const existingBase = rootValue(splitRoot(current).rootLines, "openai_base_url");
-  if (isManagedRouterBaseUrl(existingBase) &&
-      new URL(existingBase).pathname.replace(/\/$/, "").endsWith(CODEX_PATCH_HOOK_BASE_PATH)) {
-    return loopback(PORTS.router, CODEX_PATCH_HOOK_BASE_PATH);
+  if (isManagedRouterBaseUrl(existingBase)) {
+    const pathname = new URL(existingBase).pathname.replace(/\/$/, "");
+    const capabilityPath = CODEX_PATCH_CAPABILITY_PATHS.find((base) => pathname.endsWith(base));
+    if (capabilityPath) return loopback(PORTS.router, capabilityPath);
   }
   return loopback(PORTS.router, "/v1");
 }
@@ -270,66 +269,8 @@ function removeMarkedBlock(input) {
   );
 }
 
-function removeCreatedAgentsTableIfEmpty(input) {
-  const lines = input.split("\n");
-  const markerIndex = lines.findIndex(
-    (line) => line.trim() === createdAgentsTableMarker,
-  );
-  if (markerIndex === -1) return input;
-
-  let headerIndex = markerIndex + 1;
-  while (headerIndex < lines.length && !lines[headerIndex].trim()) headerIndex += 1;
-  if (!/^\s*\[\s*agents\s*\]\s*(?:#.*)?$/.test(lines[headerIndex] || "")) {
-    lines.splice(markerIndex, 1);
-    return lines.join("\n");
-  }
-
-  let tableEnd = headerIndex + 1;
-  while (tableEnd < lines.length && !/^\s*\[/.test(lines[tableEnd])) tableEnd += 1;
-  const hasUserValues = lines
-    .slice(headerIndex + 1, tableEnd)
-    .some((line) => line.trim() && !line.trim().startsWith("#"));
-  if (hasUserValues) {
-    lines.splice(markerIndex, 1);
-  } else {
-    lines.splice(headerIndex, 1);
-    lines.splice(markerIndex, 1);
-  }
-  return lines.join("\n");
-}
-
-function removeEmptyFeaturesTable(input) {
-  const lines = input.split("\n");
-  const headers = lines
-    .map((line, index) =>
-      /^\s*\[features\]\s*(?:#.*)?$/.test(line) ? index : -1,
-    )
-    .filter((index) => index !== -1);
-  if (!headers.length) return input;
-  const remove = new Set();
-  for (const header of headers) {
-    let tableEnd = header + 1;
-    while (tableEnd < lines.length && !/^\s*\[/.test(lines[tableEnd])) tableEnd += 1;
-    const hasValue = lines
-      .slice(header + 1, tableEnd)
-      .some((line) => line.trim() && !line.trim().startsWith("#"));
-    if (hasValue) continue;
-    remove.add(header);
-    for (let index = header + 1; index < tableEnd; index += 1) remove.add(index);
-  }
-  if (!remove.size) return input;
-  return lines
-    .map((line, index) => (remove.has(index) ? null : line))
-    .filter((line) => line !== null)
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trimEnd();
-}
-
 function withoutManagedAgentConcurrency(input) {
-  return removeCreatedAgentsTableIfEmpty(
-    removeMarkerPair(input, agentConcurrencyStartMarker, agentConcurrencyEndMarker),
-  );
+  return removeMarkerPair(input, agentConcurrencyStartMarker, agentConcurrencyEndMarker);
 }
 
 function withoutManagedMultiAgentV2(input) {
@@ -1134,20 +1075,7 @@ function readProviderModeState() {
 }
 
 function writeProviderModeState(value) {
-  mkdirSync(path.dirname(CODEX_PROVIDER_MODE_PATH), { recursive: true, mode: 0o700 });
-  const temporary = `${CODEX_PROVIDER_MODE_PATH}.tmp.${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  try {
-    protectPrivateFile(temporary);
-    renameSync(temporary, CODEX_PROVIDER_MODE_PATH);
-    protectPrivateFile(CODEX_PROVIDER_MODE_PATH);
-  } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
-    throw error;
-  }
+  writePrivateFile(CODEX_PROVIDER_MODE_PATH, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function clearProviderModeState() {
@@ -1192,20 +1120,7 @@ function readSignedProviderModeState() {
 }
 
 function writeSignedProviderModeState(value) {
-  mkdirSync(path.dirname(SIGNED_PROVIDER_MODE_PATH), { recursive: true, mode: 0o700 });
-  const temporary = `${SIGNED_PROVIDER_MODE_PATH}.tmp.${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  try {
-    protectPrivateFile(temporary);
-    renameSync(temporary, SIGNED_PROVIDER_MODE_PATH);
-    protectPrivateFile(SIGNED_PROVIDER_MODE_PATH);
-  } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
-    throw error;
-  }
+  writePrivateFile(SIGNED_PROVIDER_MODE_PATH, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function clearSignedProviderModeState() {
@@ -1295,9 +1210,7 @@ function clean(contents) {
   const knownManaged =
     markerPairs.some(([start]) => contents.includes(start)) ||
     knownCatalogPaths.some((catalogPath) => contents.includes(catalogPath));
-  const withoutBlock = removeEmptyFeaturesTable(
-    removeCreatedAgentsTableIfEmpty(removeMarkedBlock(contents)),
-  );
+  const withoutBlock = removeMarkedBlock(contents);
   const { rootLines, tableLines } = splitRoot(withoutBlock);
   const rootText = rootLines.join("\n");
   const bases = new Set(rootAssignmentIndexes(rootText, "openai_base_url"));
@@ -1584,17 +1497,7 @@ function restoreNativeCatalog(contents) {
 }
 
 function atomicWrite(contents) {
-  mkdirSync(path.dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
-  const temporary = `${CONFIG_PATH}.tmp.${process.pid}`;
-  writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
-  try {
-    protectPrivateFile(temporary);
-    renameSync(temporary, CONFIG_PATH);
-    protectPrivateFile(CONFIG_PATH);
-  } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
-    throw error;
-  }
+  writePrivateFile(CONFIG_PATH, contents);
 }
 
 if (!new Set([

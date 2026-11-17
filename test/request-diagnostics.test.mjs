@@ -73,6 +73,10 @@ test("contextBytes is only measured for Grok OAuth 4.6 ingress", () => {
 });
 
 test("diagnostic metadata keeps only bounded requestId and contextBytes", () => {
+  for (const requestKind of ["generation", "compaction"]) {
+    assert.deepEqual(usageDiagnosticMetadata({ requestKind }), { requestKind });
+  }
+  assert.deepEqual(usageDiagnosticMetadata({ requestKind: "private prompt" }), {});
   assert.equal(safeDiagnosticRequestId("12"), "12");
   assert.equal(safeDiagnosticRequestId(7), "7");
   assert.equal(
@@ -123,6 +127,7 @@ test("usage events persist requestId and contextBytes without content leakage", 
       status: 200,
       durationMs: 10,
       requestId: "42",
+      requestKind: "compaction",
       grokStructuredPatch: { enabled: true, applied: true, schemaVersion: 1, prompt: "never persisted" },
       contextBytes: measureIngressContextBytes({
         instructions: "keep this out of the ledger",
@@ -136,6 +141,7 @@ test("usage events persist requestId and contextBytes without content leakage", 
     });
     const [event] = usage.recentUsageEvents();
     assert.equal(event.requestId, "42");
+    assert.equal(event.requestKind, "compaction");
     assert.deepEqual(event.grokStructuredPatch, { enabled: true, applied: true, schemaVersion: 1 });
     assert.deepEqual(event.contextBytes, {
       observationPoint: ROUTER_INGRESS_OBSERVATION_POINT,
@@ -146,6 +152,7 @@ test("usage events persist requestId and contextBytes without content leakage", 
       ]),
     });
     const raw = readFileSync(usage.USAGE_EVENTS_PATH, "utf8");
+    assert.equal(JSON.parse(raw).requestKind, "compaction");
     assert.equal(raw.includes("keep this out of the ledger"), false);
     assert.equal(raw.includes("/secret/notes.md"), false);
     assert.equal(raw.includes("private turn"), false);
@@ -251,4 +258,35 @@ test("client hook diagnostic mode is optional, constrained, and content-free", (
   assert.deepEqual(sanitizeGrokStructuredPatch({ ...safe, command: "private patch", rawArguments: "private history" }), safe);
   assert.deepEqual(usageDiagnosticMetadata({ grokStructuredPatch: safe }), { grokStructuredPatch: safe });
   for (const mode of ["private prompt", {}, 1, null]) assert.equal(sanitizeGrokStructuredPatch({ ...safe, mode }), undefined);
+});
+
+test("a free/auto row read back keeps the member it fell back from, so the pool view can count fallbacks", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-diagnostics-free-pool-"));
+  const previousStateDir = process.env.MODEL_ROUTER_STATE_DIR;
+  process.env.MODEL_ROUTER_STATE_DIR = stateDir;
+  try {
+    const usage = await import(`../src/usage-events.mjs?freepool=${Date.now()}`);
+    usage.recordUsageEvent({
+      model: "free/auto",
+      provider: "free",
+      status: 200,
+      durationMs: 12,
+      inputTokens: 15,
+      outputTokens: 1,
+      requestId: "turn-1",
+      failoverFrom: "free/recursive/flint-v1.0:free",
+      freePool: "free/auto",
+    });
+    const event = usage.recentUsageEvents().find((row) => row.requestId === "turn-1");
+    assert.equal(event.failoverFrom, "free/recursive/flint-v1.0:free");
+    assert.equal(event.freePool, "free/auto");
+    const { freePoolStatus } = await import("../src/free-pool.mjs");
+    const status = freePoolStatus({ events: [event] });
+    assert.equal(status.usage.fallbacks, 1);
+    assert.equal(status.usage.recent[0].failoverFrom, "free/recursive/flint-v1.0:free");
+  } finally {
+    if (previousStateDir === undefined) delete process.env.MODEL_ROUTER_STATE_DIR;
+    else process.env.MODEL_ROUTER_STATE_DIR = previousStateDir;
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 });

@@ -47,6 +47,7 @@ import {
 } from "./process-tree.mjs";
 import { inheritedProxyEnvironment } from "./proxy-environment.mjs";
 import { routerNodeBinary } from "./node-runtime.mjs";
+import { processStartIdentity } from "./process-identity.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
 
 // The tray launches this control process from the desktop session, which can
@@ -343,15 +344,9 @@ async function emitProbe() {
     : [];
   // Local proof records are surfaced for status only. They never alter the
   // registry capability sent to Codex.
-  const { applySubagentProofs } = await import("./subagent-proofs.mjs");
-  const effectiveListedModels = applySubagentProofs(
-    LISTED_MODELS,
-    subagentSettings.proofs,
-    { hidden: hiddenModels },
-  );
   // The tray groups models by provider to build its rows, so protocol
   // variants report their canonical family id: one opencode Go row, not three.
-  const routedModels = effectiveListedModels.map((model) => ({
+  const routedModels = LISTED_MODELS.map((model) => ({
     slug: model.slug,
     displayName: model.displayName,
     provider: canonicalProviderId(model.provider),
@@ -428,6 +423,7 @@ async function emitProbe() {
               subagents: subagentSettings,
               picker: modelPickerSnapshot(),
               toolResultAging: toolResultAgingSnapshot(),
+              compatibilityLayer: (await import("./compatibility-layer-state.mjs")).readCompatibilityLayerSettings(),
               localModels: {
                 ...localModelsSnapshot({
                   inventory: localInventory,
@@ -515,17 +511,12 @@ async function routerCatalogSnapshot() {
   const { CHECKED_IN_MODELS, LOCAL_MODEL_SLUGS } = await import("./model-registry.mjs");
   const { modelPickerSnapshot } = await import("./model-picker-state.mjs");
   const { subagentSettingsSnapshot } = await import("./multi-agent-state.mjs");
-  const { applySubagentProofs } = await import("./subagent-proofs.mjs");
   const { routerDashboardState } = await import("./router-dashboard.mjs");
   const settings = subagentSettingsSnapshot();
   const picker = modelPickerSnapshot();
   const hidden = new Set(picker.hidden);
   const visible = new Set(picker.visible);
-  const models = applySubagentProofs(
-    selectedConfiguredListedModels(),
-    settings.proofs,
-    { hidden, disabled: settings.disabled },
-  ).map((model) => ({
+  const models = selectedConfiguredListedModels().map((model) => ({
     slug: model.slug,
     displayName: model.displayName,
     provider: canonicalProviderId(model.provider),
@@ -812,6 +803,9 @@ async function printAccountUsage() {
   } = await import("./chatgpt-profile-switch.mjs");
   await ensureChatGPTProfileAccounts();
   const profile = selectedChatGPTUsageProfile();
+  if (!profile.home && profile.selection !== "auto" && profile.selection !== "primary") {
+    throw new Error("The selected ChatGPT login profile is unavailable. Refresh the saved accounts before reading usage.");
+  }
   const usage = profile.home
     ? await readCodexAccountUsage({ codexHome: profile.home })
     : await readCodexAccountUsage();
@@ -826,6 +820,42 @@ async function printAccountUsage() {
 async function printProviderUsage() {
   const { providerUsageSnapshot } = await import("./provider-usage.mjs");
   process.stdout.write(`${JSON.stringify(await providerUsageSnapshot(), null, 2)}\n`);
+}
+
+// free/auto's local status: members, drains, the cached catalog, and the
+// pool's usage rows. Everything is read from this machine's state directory.
+async function handleFreePool(action = "status") {
+  const freePool = await import("./free-pool.mjs");
+  if (action === "status") {
+    const { recentUsageEvents } = await import("./usage-events.mjs");
+    const { readProviderSelection } = await import("./provider-selection.mjs");
+    const enabled = new Set(readProviderSelection());
+    const status = freePool.freePoolStatus({
+      events: recentUsageEvents({ sinceMs: 7 * 24 * 60 * 60 * 1000, limit: Number.POSITIVE_INFINITY }),
+      providerEnabled: (id) => enabled.has(id),
+    });
+    process.stdout.write(`${JSON.stringify({ ...status, enabled: enabled.has("free") }, null, 2)}\n`);
+    return;
+  }
+  if (action === "refresh") {
+    const result = await freePool.refreshFreePoolCatalog();
+    process.stdout.write(`${JSON.stringify({
+      written: result.written,
+      fetchedAt: result.fetchedAt,
+      kilo: result.kilo.map((entry) => entry.id),
+      opencode: result.opencode.map((entry) => entry.id),
+      errors: result.errors,
+      note: "Restart the router (./bin/model-router restart) for a changed member list to take effect.",
+    }, null, 2)}\n`);
+    if (!result.written) process.exitCode = 1;
+    return;
+  }
+  if (action === "reset") {
+    freePool.clearAllFreePoolDrains();
+    process.stdout.write(`${JSON.stringify({ drains: 0 })}\n`);
+    return;
+  }
+  throw new Error("Usage: control free-pool status|refresh|reset");
 }
 
 async function printProviderOnboarding() {
@@ -1576,14 +1606,16 @@ async function handleSubagents(action, value, flag, rest = []) {
     const slug = String(value || "").trim();
     if (!slug) throw new Error("Usage: control subagents explain <model-slug> [--json]");
     const [
-      { MODELS },
+      { MODELS, RUNTIME_PROVIDERS },
       { readProviderSelection, canonicalProviderId },
+      { genericProviderConfigured },
       { readHiddenModels },
       { explainSubagentRoute, formatSubagentExplanation },
       { CODEX_AGENTS_DIR },
     ] = await Promise.all([
       import("./model-registry.mjs"),
       import("./provider-selection.mjs"),
+      import("./generic-provider-readiness.mjs"),
       import("./model-picker-state.mjs"),
       import("./subagent-explain.mjs"),
       import("./paths.mjs"),
@@ -1592,7 +1624,9 @@ async function handleSubagents(action, value, flag, rest = []) {
     const explanation = explainSubagentRoute({
       slug,
       models: MODELS,
-      providerEnabled: (providerId) => selected.has(canonicalProviderId(providerId)),
+      providerEnabled: (providerId) => RUNTIME_PROVIDERS.get(providerId)?.generic === true
+        ? genericProviderConfigured(providerId)
+        : selected.has(canonicalProviderId(providerId)),
       hidden: readHiddenModels(),
       reasoningLevels: await modelReasoningLevels(slug),
       agentsDir: CODEX_AGENTS_DIR,
@@ -1686,125 +1720,6 @@ async function handleSubagents(action, value, flag, rest = []) {
     await refreshModelSettingsCatalog();
     process.stdout.write(`${JSON.stringify({ verified })}\n`);
     return;
-  } else if (action === "certify") {
-    // The whole five-check run, for one route or several. Unlike `verify`
-    // above, whose two-request probe is diagnostic, a complete pass here
-    // promotes the route on this machine. It spends real quota on each route's
-    // own provider and on the native parent that delegates to it.
-    //
-    // The runs go in parallel because nothing about one route's checks touches
-    // another's: separate credentials, separate ephemeral Codex homes,
-    // separate application artifacts. What they do share is the proofs file
-    // and the catalog, so the recording and the republish stay here, in one
-    // process, after the fan-out -- two control processes racing
-    // read-modify-write on the proofs file would silently drop a verdict.
-    const slugs = [...new Set([value, ...rest].map((slug) => String(slug || "").trim()).filter(Boolean))];
-    if (!slugs.length) throw new Error("Usage: control subagents certify <model-slug> [<model-slug> ...]");
-    for (const slug of slugs) {
-      if (!(await knownModelSlug(slug))) throw new Error(`Unknown model slug: ${slug}`);
-    }
-    const [
-      { verifySubagentRoute, firstFailure, recordApplicationEvidence, runDeferred },
-      { recordVerification, recordVerificationStarted, clearSubagentProof },
-      { assertCallerSecret, callerBaseUrl },
-      { CALLER_SECRET_PATH, PORTS },
-      { findCodexBinary },
-      { VERSION },
-    ] = await Promise.all([
-      import("./subagent-certify.mjs"),
-      import("./subagent-proofs.mjs"),
-      import("./caller-auth.mjs"),
-      import("./paths.mjs"),
-      import("./codex-binary.mjs"),
-      import("./version.mjs"),
-    ]);
-    const { existsSync, readFileSync } = await import("node:fs");
-    if (!existsSync(CALLER_SECRET_PATH)) {
-      throw new Error(
-        "The local router caller key is missing; run ./bin/doctor --fix (.\\codex-router.ps1 doctor --fix on Windows).",
-      );
-    }
-    const secret = assertCallerSecret(readFileSync(CALLER_SECRET_PATH, "utf8").trim());
-    const codexBin = findCodexBinary();
-    const baseUrl = callerBaseUrl(PORTS.router, secret);
-    const { CODEX_HOME, MERGED_CATALOG_PATH } = await import("./paths.mjs");
-    for (const slug of slugs) recordVerificationStarted(slug);
-    const outcomes = await Promise.all(
-      slugs.map(async (slug) => {
-        try {
-          return {
-            slug,
-            result: await verifySubagentRoute(slug, {
-              baseUrl,
-              secret,
-              codexBin,
-              codexHome: CODEX_HOME,
-              catalogPath: MERGED_CATALOG_PATH,
-              routerVersion: VERSION,
-            }),
-          };
-        } catch (error) {
-          // One route's crash is not a verdict on the others, and must not
-          // reject the whole fan-out.
-          return { slug, error: error instanceof Error ? error.message : String(error) };
-        }
-      }),
-    );
-    const results = [];
-    let promoted = false;
-    for (const { slug, result, error } of outcomes) {
-      if (!result) {
-        recordVerification(slug, { checks: {}, routerVersion: VERSION, reason: error });
-        results.push({ slug, certified: false, reason: error });
-        continue;
-      }
-      // A run that only met a rate limit, an outage, or a missing entitlement
-      // learned nothing about the route. Clearing the record leaves the switch
-      // retryable instead of leaving "No" next to a model that was never
-      // actually refused.
-      if (!result.ok && runDeferred(result.checks)) {
-        clearSubagentProof(slug);
-        const detail = firstFailure(result.checks)?.detail;
-        results.push({ slug, certified: false, deferred: true, reason: detail });
-        continue;
-      }
-      recordVerification(slug, {
-        checks: result.checks,
-        routerVersion: VERSION,
-        ...(result.ok ? {} : { reason: firstFailure(result.checks)?.detail }),
-      });
-      // A pass is evidence worth more than this machine. Filing it as a
-      // v2_agent application is what lets a review promote the route for every
-      // installer, so nobody -- including this operator on their next machine
-      // -- pays to measure it again.
-      let application;
-      if (result.ok) {
-        promoted = true;
-        try {
-          application = recordApplicationEvidence(slug, {
-            checks: result.checks,
-            routerVersion: VERSION,
-            at: new Date().toISOString(),
-          });
-        } catch {
-          // A read-only or relocated checkout must not turn a genuine pass
-          // into a failure; the machine-local record already stands on its own.
-        }
-      }
-      const failure = result.ok ? undefined : firstFailure(result.checks);
-      results.push({
-        slug,
-        certified: result.ok,
-        ...(application ? { application } : {}),
-        ...(failure ? { failed: failure.check, failedLabel: failure.label, reason: failure.detail } : {}),
-      });
-    }
-    // One republish for the whole fan-out, and only when something was
-    // promoted: publication rewrites the merged catalog and the agents
-    // directory, which is far too much work to repeat per failed route.
-    if (promoted) await refreshModelSettingsCatalog();
-    process.stdout.write(`${JSON.stringify({ results })}\n`);
-    return;
   } else if (action === "set") {
     if (!["on", "off"].includes(flag)) {
       throw new Error("Usage: control subagents set <model-slug> <on|off>");
@@ -1876,7 +1791,7 @@ async function handleSubagents(action, value, flag, rest = []) {
       "Usage: control subagents status|explain <model-slug> [--json]|select-all|unselect-all|" +
         "mode <all|selected|proven>|" +
         "set <model-slug> <on|off>|effort <model-slug> <level|default>|" +
-        "provider <provider-id> <on|off>|verify [model-slug ...]|certify <model-slug>|" +
+        "provider <provider-id> <on|off>|verify [model-slug ...]|" +
         "policy status|provider <provider-id> <on|off>|model <model-slug> <on|off>|family <name> <on|off>",
     );
   }
@@ -1885,7 +1800,7 @@ async function handleSubagents(action, value, flag, rest = []) {
 }
 
 const TOOL_RESULT_AGING_USAGE =
-  "Usage: control tool-result-aging status|on|off|native <on|off>|ttl <days|off|default>|" +
+  "Usage: control tool-result-aging status|on|off|native <on|off>|ttl <days|off|default>|read <handle> [--offset N] [--limit N] [--find TEXT]|" +
   "purge [--yes] [--dry-run] [--expired]";
 
 // Emptying the store deletes the only copy of bytes the model already saw, so
@@ -1917,9 +1832,11 @@ async function handleToolResultAgingPurge(flags) {
         "Set one with ./bin/control tool-result-aging ttl <days>, or purge without --expired.",
     );
   }
-  const result = expiredOnly
+  const operation = () => expiredOnly
     ? expireRetainedToolResults({ dryRun: previewOnly, ttlMs })
     : purgeRetainedToolResults({ dryRun: previewOnly });
+  const { withRetainedToolResultsLock } = await import("./tool-result-recovery.mjs");
+  const result = previewOnly ? operation() : await withRetainedToolResultsLock(operation);
   const age =
     result.oldestAgeMs === undefined ? "" : `, oldest ${describeRetentionAge(result.oldestAgeMs)} old`;
   const scope = expiredOnly ? ` older than ${describeRetentionTtl(ttlMs)}` : "";
@@ -1964,6 +1881,11 @@ async function handleToolResultAging(action, nativeAction, flags = []) {
   const desired = action || "status";
   if (desired === "status") {
     process.stdout.write(`${JSON.stringify(toolResultAgingSnapshot())}\n`);
+    return;
+  }
+  if (desired === "read") {
+    const { readToolResultCommand } = await import("./tool-result-read.mjs");
+    process.stdout.write(`${JSON.stringify(readToolResultCommand(flags))}\n`);
     return;
   }
   if (desired === "purge") {
@@ -2509,7 +2431,7 @@ async function handleLocalModels(action, value, ...rest) {
   }
   if (action === "mlx-install") {
     const { startLocalMlxOperation } = await import("./local-mlx-operation.mjs");
-    const result = startLocalMlxOperation({ yes: value === "--yes" || flags.has("--yes") });
+    const result = await startLocalMlxOperation({ yes: value === "--yes" || flags.has("--yes") });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     return;
   }
@@ -2548,10 +2470,11 @@ async function handleLocalModels(action, value, ...rest) {
       updatedAt: Date.now(),
       kind: "download",
       controllerPid: process.pid,
+      controllerIdentity: processStartIdentity(process.pid),
       workerPid: null,
       ...extra,
     });
-    const claim = claimLocalOperation(tag, "download");
+    const claim = await claimLocalOperation(tag, "download");
     if (!claim.acquired) {
       const active = readLocalDownload();
       if (isLocalOperationActive(active) && active.tag !== tag) {
@@ -2606,7 +2529,7 @@ async function handleLocalModels(action, value, ...rest) {
       }
       writePhase("Checking model and machine fit");
     } finally {
-      claim.release();
+      await claim.release();
     }
     const cancelled = () => readLocalDownload()?.status === "cancelled";
     try {
@@ -2673,7 +2596,9 @@ async function handleLocalModels(action, value, ...rest) {
         startedAt,
         updatedAt: Date.now(),
         controllerPid: null,
+        controllerIdentity: null,
         workerPid: child.pid,
+        workerIdentity: processStartIdentity(child.pid),
       });
       // Advisory, never blocking: the operator may well want a vision-only
       // model, but they should know before the gigabytes land.
@@ -2743,7 +2668,7 @@ async function handleLocalModels(action, value, ...rest) {
       readLocalDownload,
       writeLocalDownload,
     } = await import("./local-download.mjs");
-    const claim = claimLocalOperation(tag, "uninstall");
+    const claim = await claimLocalOperation(tag, "uninstall");
     if (!claim.acquired) {
       const active = readLocalDownload();
       if (isLocalOperationActive(active) && active.tag === tag) {
@@ -2796,6 +2721,7 @@ async function handleLocalModels(action, value, ...rest) {
         startedAt,
         updatedAt: startedAt,
         controllerPid: process.pid,
+        controllerIdentity: processStartIdentity(process.pid),
         workerPid: null,
       });
       try {
@@ -2813,7 +2739,9 @@ async function handleLocalModels(action, value, ...rest) {
         writeLocalDownload({
           ...readLocalDownload(),
           controllerPid: null,
+          controllerIdentity: null,
           workerPid: child.pid,
+          workerIdentity: processStartIdentity(child.pid),
           updatedAt: Date.now(),
         });
       } catch (error) {
@@ -2823,6 +2751,7 @@ async function handleLocalModels(action, value, ...rest) {
           detail: "Removal failed to start",
           updatedAt: Date.now(),
           controllerPid: null,
+          controllerIdentity: null,
           error: error instanceof Error ? error.message : String(error),
         });
         throw error;
@@ -2851,12 +2780,13 @@ async function handleLocalModels(action, value, ...rest) {
       updatedAt: finishedAt,
       workerPid: null,
       controllerPid: null,
+      controllerIdentity: null,
       ...(warnings.catalogError ? { catalogError: warnings.catalogError } : {}),
       ...(warnings.restartError ? { restartError: warnings.restartError } : {}),
       error: undefined,
     });
     } finally {
-      claim.release();
+      await claim.release();
     }
   } else if (action === "set") {
     if (!["on", "off"].includes(positional)) {
@@ -3645,6 +3575,8 @@ if (args.includes("--probe")) {
   await printAccountUsage();
 } else if (args[0] === "provider-usage") {
   await printProviderUsage();
+} else if (args[0] === "free-pool") {
+  await handleFreePool(args[1] || "status");
 } else if (args[0] === "providers") {
   await printProviderOnboarding();
 } else if (args[0] === "generic-providers") {
@@ -3687,6 +3619,20 @@ if (args.includes("--probe")) {
   await setRouterDefault(args[1], args[2]);
 } else if (args[0] === "subagents") {
   await handleSubagents(args[1], args[2], args[3], args.slice(2));
+} else if (args[0] === "compatibility-layer") {
+  const { readCompatibilityLayerSettings, setCompatibilityLayerEnabled, COMPATIBILITY_LAYER_PATH } =
+    await import("./compatibility-layer-state.mjs");
+  const action = args[1] || "status";
+  if (!["status", "on", "off"].includes(action) || args.length > 2) {
+    throw new Error("Usage: control compatibility-layer status|on|off");
+  }
+  if (action !== "status") {
+    const { assertStateOwnership } = await import("./state-owner.mjs");
+    assertStateOwnership("change compatibility layer settings");
+  }
+  process.stdout.write(`${JSON.stringify(action === "status"
+    ? { ...readCompatibilityLayerSettings(), path: COMPATIBILITY_LAYER_PATH }
+    : setCompatibilityLayerEnabled(action === "on"))}\n`);
 } else if (args[0] === "tool-result-aging") {
   await handleToolResultAging(args[1], args[2], args.slice(2));
 } else if (args[0] === "local-models") {

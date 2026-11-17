@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { executeStartupFixture, startupFixturePaths } from "./startup-attempts-fixture.mjs";
+import { awaitChildExits } from "../src/bounded-teardown.mjs";
 
 const root = process.env.PR895_REVIEW_SOURCE_DIR
   || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -96,6 +97,7 @@ async function run({ foreground = false, disabled = false, mode = "healthy", see
       }
       if (mode === "child-exited") throw new Error("fixture child exited before becoming healthy");
     } },
+    "./startup-dependency-gate.mjs": { DEFAULT_STARTUP_HOLD_MS: 1 },
     "./fatal-exit.mjs": { describeChildExit: () => "code 0", fatalExitFollowUp: () => undefined },
     "./gateway-supervisor.mjs": { gatewaySupervisorLimits: () => ({}), superviseGateway: async () => {
       events.push("supervise");
@@ -104,10 +106,13 @@ async function run({ foreground = false, disabled = false, mode = "healthy", see
       return { label: "fixture gateway", code: 0 };
     } },
     "./litellm-config.mjs": { writeLiteLlmConfig: () => {} },
-    "./model-registry.mjs": { MODELS: [] },
-    "./local-models.mjs": { readLocalModelSelection: () => ({ enabled: [] }) },
+    "./model-registry.mjs": { MODELS: [], COMPATIBILITY_LAYER: { enabled: true } },
+    "./runtime-dependency-requirements.mjs": { runtimeDependencyRequirements: () => ({
+      needsGateway: true, services: ["kimi", "api", "grok", "gateway"],
+    }) },
     "./antigravity-oauth-status.mjs": { antigravityOAuthStartupState: () => ({ startForwarder: false }), antigravityOAuthStatus: () => ({}) },
     "./antigravity-probe-activation.mjs": { attemptAntigravityProbePromotionAfterReadiness: async () => true },
+    "./bounded-teardown.mjs": { awaitChildExits },
     "./spawnable-command.mjs": { spawnableCommand: (command, args) => ({ command, args, options: {} }) },
     "./ollama-runtime.mjs": { ensureOllamaHeadless: async () => {} },
     "./venv-runtime.mjs": { venvRuntimeOutcome: () => ({ kind: "ok" }), venvRuntimeProblem: () => undefined },

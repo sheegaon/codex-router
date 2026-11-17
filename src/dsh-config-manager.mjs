@@ -11,7 +11,7 @@
 // every other byte as somebody else's work. Anything it cannot read plainly is
 // refused with the file untouched.
 
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -25,7 +25,7 @@ import {
   PORTS,
   LEGACY_PORTS,
 } from "./paths.mjs";
-import { protectPrivateFile } from "./file-security.mjs";
+import { writePrivateFile } from "./file-security.mjs";
 import { refreshDshCallerCapabilityDocuments } from "./caller-key-client-refresh.mjs";
 import {
   DSH_CREDENTIAL_REF,
@@ -66,18 +66,7 @@ function readDocument(target) {
 // authentication capability, and the credentials document carries the key it
 // references.
 function writeDocument(target, contents) {
-  mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  const temporary = `${target}.tmp.${process.pid}`;
-  writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
-  try {
-    protectPrivateFile(temporary);
-    renameSync(temporary, target);
-    protectPrivateFile(target);
-  } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
-    throw error;
-  }
-  return target;
+  return writePrivateFile(target, contents);
 }
 
 function joinLines(lines) {
@@ -359,42 +348,41 @@ function defaultModelSnapshotPath() {
 // reversible: the previous section is snapshotted verbatim and put back on
 // uninstall. This mirrors how the Codex login-free mode treats `model` and
 // `model_provider` rather than inventing a second discipline.
+function readDefaultModelSnapshot() {
+  const target = defaultModelSnapshotPath();
+  if (!existsSync(target)) return undefined;
+  let snapshot;
+  try { snapshot = JSON.parse(readFileSync(target, "utf8")); } catch {
+    throw new Error("The DSH default-model snapshot is unreadable; refusing to discard it.");
+  }
+  if (snapshot?.version !== 1 || !(snapshot.previous === null ||
+    (Array.isArray(snapshot.previous) && snapshot.previous.every((line) => typeof line === "string")))) {
+    throw new Error("The DSH default-model snapshot is invalid; refusing to discard it.");
+  }
+  return snapshot;
+}
+
+function routerOwnsDefault(document, node) {
+  return Boolean(node && document.lines.slice(node.index, node.endIndex + 1)
+    .some((line) => new RegExp(`^\\s*provider:\\s*['"]?${DSH_ROUTE_ID}['"]?\\s*$`).test(line)));
+}
+
 function snapshotDefaultModel(contents) {
   const document = scanYamlDocument(contents);
   const node = yamlNode(document, DEFAULT_MODEL_PATH);
-  const previous = node
-    ? document.lines.slice(node.index, node.endIndex + 1)
-    : null;
-  writeDocument(
-    defaultModelSnapshotPath(),
-    `${JSON.stringify({ version: 1, previous }, null, 2)}\n`,
-  );
+  const snapshot = readDefaultModelSnapshot();
+  // Repeated publication is still the same ownership period. Capturing our
+  // own default here would replace the only copy of the user's selection.
+  if (snapshot && routerOwnsDefault(document, node)) return;
+  const previous = node ? document.lines.slice(node.index, node.endIndex + 1) : null;
+  writeDocument(defaultModelSnapshotPath(), `${JSON.stringify({ version: 1, previous }, null, 2)}\n`);
 }
 
 function restoreDefaultModel(contents) {
-  const target = defaultModelSnapshotPath();
   const document = scanYamlDocument(contents);
   const node = yamlNode(document, DEFAULT_MODEL_PATH);
-  // Whether the default currently in the document is one this router wrote.
-  // Between a snapshot and now the user may have chosen their own -- the
-  // harness's own Models page writes the same key -- and putting a snapshot
-  // back over that is not a restore, it is discarding a later choice.
-  const routerOwnsCurrent = Boolean(
-    node &&
-      document.lines
-        .slice(node.index, node.endIndex + 1)
-        .some((line) => new RegExp(`^\\s*provider:\\s*['"]?${DSH_ROUTE_ID}['"]?\\s*$`).test(line)),
-  );
-
-  let previous;
-  if (existsSync(target)) {
-    try {
-      previous = JSON.parse(readFileSync(target, "utf8")).previous;
-    } catch {
-      previous = undefined;
-    }
-    unlinkSync(target);
-  }
+  const routerOwnsCurrent = routerOwnsDefault(document, node);
+  const previous = readDefaultModelSnapshot()?.previous;
 
   // Somebody else's choice, or no default at all: nothing here belongs to this
   // router, so nothing is touched.
@@ -496,6 +484,8 @@ export function uninstall() {
     );
   }
   if (existsSync(DSH_CATALOG_PATH)) unlinkSync(DSH_CATALOG_PATH);
+  const snapshotPath = defaultModelSnapshotPath();
+  if (existsSync(snapshotPath)) unlinkSync(snapshotPath);
   return {
     settings: DSH_SETTINGS_PATH,
     credentials: DSH_CREDENTIALS_PATH,

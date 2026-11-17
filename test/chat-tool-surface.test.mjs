@@ -6,7 +6,9 @@ import {
   GROQ_MAX_TOOLS,
   GROQ_TOOL_LIMIT_CODE,
 } from "../src/chat-tool-surface.mjs";
-import { mergeCodexAppTools } from "../src/codex-app-tools.mjs";
+import { CODEX_APP_TOOLS, mergeCodexAppTools } from "../src/codex-app-tools.mjs";
+import { grokLiteralDomain } from "../src/grok-tool-schema.mjs";
+import { moonshotSchemaRoute } from "../src/moonshot-schema-routes.mjs";
 import {
   buildNamespaceLookups,
   flattenNamespacedHistory,
@@ -14,6 +16,7 @@ import {
   flattenToolSearchHistory,
   flattenToolChoice,
   rewriteNamespaceResponsePayload,
+  repairToolSchemaRoots,
   toolSearchRelayAvailable,
 } from "../src/namespace-relay.mjs";
 
@@ -814,7 +817,7 @@ test("a fresh routed turn keeps every app connector eager by default", () => {
     JSON.stringify(routed.tools).length,
     JSON.stringify(optedOut.tools).length,
   );
-  assert.equal(routed.tools.length, 576);
+  assert.equal(routed.tools.length, 558);
   assert.deepEqual(
     eagerConnectorNamespaces(routed.tools),
     REAL_TURN_NAMESPACES.map(([name]) => name).filter((name) =>
@@ -832,14 +835,11 @@ test("the connector allow-list value none withholds every connector", () => {
   );
   const eagerBytes = JSON.stringify(eager.tools).length;
   const routedBytes = JSON.stringify(routed.tools).length;
-  // This deterministic fixture expands to 576 tools and over 900 KiB.
-  assert.equal(eager.tools.length, 576);
+  // This deterministic fixture expands to 558 tools and over 900 KiB.
+  assert.equal(eager.tools.length, 558);
   assert.ok(eagerBytes > 900 * 1024, `${eagerBytes} bytes eager`);
-  // What is left is the client's non-connector namespaces plus the app
-  // snapshot the router injects itself (~53 KB of the total, half of it the
-  // `inputSchema` copy `flattenNamespaceChild` keeps beside `parameters`).
-  // Both are required eager, so the floor sits above the 100 KB the connector
-  // removal alone would suggest.
+  // The remaining surface is exactly the client's non-connector tools;
+  // modern MCP app registration must not acquire a second legacy snapshot.
   assert.ok(routedBytes < 128 * 1024, `${routedBytes} bytes routed`);
   assert.ok(routedBytes * 8 < eagerBytes, `${routedBytes} of ${eagerBytes} bytes`);
   const names = routed.tools.map((tool) => tool.name);
@@ -854,7 +854,7 @@ test("the connector allow-list value none withholds every connector", () => {
   assert.ok(names.includes("mcp__node_repl__node_repl_op_0"));
   assert.ok(names.includes("image_gen__image_gen_op_0"));
   assert.ok(names.includes("mcp__openai_artifact_template_picker__openai_artifact_template_picker_op_0"));
-  assert.ok(names.includes("codex_app__automation_update"));
+  assert.ok(!names.some(name => name?.startsWith("codex_app__")));
   assert.ok(names.includes("core_op_0"));
   assert.ok(routed.tools.some((tool) => tool?.type === "custom"));
   assert.ok(routed.tools.some((tool) => tool?.type === "web_search"));
@@ -881,9 +881,8 @@ test("the connector allow-list value all restores the whole eager surface", () =
     chatProviderToolSurface(realTurnSurface(), "opencode-go"),
   );
   const declared = REAL_TURN_NAMESPACES.reduce((total, [, children]) => total + children, 0);
-  // 11 functions + custom + web_search + every namespace child + the injected
-  // codex_app (17) and plugin_management (1) app definitions.
-  assert.equal(eager.tools.length, declared + 13 + 18);
+  // 11 functions + custom + web_search + every caller-owned namespace child.
+  assert.equal(eager.tools.length, declared + 13);
   for (const [namespace, children] of REAL_TURN_NAMESPACES) {
     assert.equal(
       eager.tools.filter((tool) => tool.name?.startsWith(`${namespace}__`)).length,
@@ -970,4 +969,126 @@ test("a forced choice on a withheld connector tool restores its definition", () 
     assert.ok(names.includes("mcp__codex_apps__slack__slack_op_1"));
     assert.equal(names.filter((name) => name?.startsWith(CONNECTOR_PREFIX)).length, 1);
   });
+});
+
+test("Grok OAuth preserves exclusive schema alternatives through eager and discovered tool surfaces", () => {
+  const leaf = (mode) => ({ type: "object", properties: { mode: { const: mode }, id: { type: "string" } }, required: ["mode", "id"], additionalProperties: false });
+  const schema = { oneOf: [leaf("view"), { oneOf: [leaf("update"), leaf("delete")] }] };
+  for (const discovered of [false, true]) {
+    const namespace = { type: "namespace", name: "mcp__fixture", tools: [{ type: "function", name: "operation", inputSchema: schema }] };
+    const input = discovered ? [
+      { type: "tool_search_call", call_id: "search", execution: "client", arguments: { query: "fixture" } },
+      { type: "tool_search_output", call_id: "search", status: "completed", execution: "client", tools: [namespace] },
+    ] : [];
+    const tools = [clientToolSearch(), ...(!discovered ? [namespace] : [])];
+    for (const provider of ["grok-oauth", "grok-api", "deepseek"]) {
+      const surface = chatProviderToolSurface(tools, provider, { input, upstreamModel: "grok-4.7" });
+      const routed = flattenToolSearchHistory(input, surface.tools, surface.namespaces);
+      const tool = routed.tools.find((item) => item.name === "mcp__fixture__operation");
+      assert.ok(tool);
+      if (provider === "grok-oauth") {
+        assert.deepEqual(tool.parameters.oneOf, [schema.oneOf[0], ...schema.oneOf[1].oneOf]);
+        assert.equal(tool.inputSchema, schema);
+      } else {
+        assert.equal(tool.parameters.oneOf, undefined, "these routes still use a plain object root");
+        assert.deepEqual(tool.parameters.properties.mode, {
+          type: "string", enum: ["view", "update", "delete"],
+        });
+      }
+    }
+  }
+});
+
+test("Grok schema adapter survives deferred plain and namespace registrations referenced by history", () => {
+  const leaf = (mode) => ({ type: "object", properties: { mode: { const: mode } }, required: ["mode"], additionalProperties: false });
+  const schema = { oneOf: [leaf("a"), { oneOf: [leaf("b"), leaf("c")] }] };
+  for (const namespaced of [false, true]) {
+    const declaration = namespaced
+      ? { type: "namespace", name: "fixture", defer_loading: true, tools: [{ type: "function", name: "operation", inputSchema: schema }] }
+      : { type: "function", name: "operation", defer_loading: true, parameters: schema };
+    const input = [{ type: "function_call", name: "operation", ...(namespaced ? { namespace: "fixture" } : {}), call_id: "old", arguments: '{"mode":"b"}' }];
+    const surface = chatProviderToolSurface([clientToolSearch(), declaration], "grok-oauth", { input, upstreamModel: "grok-4.7" });
+    assert.equal(surface.tools.some((tool) => tool.name?.endsWith("operation")), false);
+    const restored = flattenToolSearchHistory(input, surface.tools, surface.namespaces);
+    const tool = restored.tools.find((item) => item.name?.endsWith("operation"));
+    assert.ok(tool);
+    assert.deepEqual(tool.parameters.oneOf, [schema.oneOf[0], ...schema.oneOf[1].oneOf]);
+  }
+});
+
+test("Grok normalizes malformed literals in eager, discovered and deferred union tools", () => {
+  const schema = { $anchor: "preserve", oneOf: [{ type: "object", properties: {
+    id: { type: "string", enum: [true] },
+  }, required: ["id"] }] };
+  for (const mode of ["eager", "discovered", "deferred"]) {
+    const declaration = { type: "function", name: "fixture", parameters: schema,
+      ...(mode === "deferred" ? { defer_loading: true } : {}) };
+    const input = mode === "discovered" ? [
+      { type: "tool_search_call", call_id: "search", execution: "client", arguments: { query: "fixture" } },
+      { type: "tool_search_output", call_id: "search", status: "completed", execution: "client", tools: [declaration] },
+    ] : mode === "deferred" ? [{ type: "function_call", name: "fixture", call_id: "old", arguments: '{"id":"x"}' }] : [];
+    const surface = chatProviderToolSurface([clientToolSearch(), ...(mode === "discovered" ? [] : [declaration])],
+      "grok-oauth", { input, upstreamModel: "grok-4.7" });
+    const routed = flattenToolSearchHistory(input, surface.tools, surface.namespaces);
+    const tool = routed.tools.find(item => item.name === "fixture");
+    assert.equal(tool.parameters.$anchor, "preserve");
+    assert.deepEqual(tool.parameters.oneOf[0].properties.id, { type: "string" }, mode);
+  }
+  assert.deepEqual(schema.oneOf[0].properties.id.enum, [true]);
+});
+
+
+test("current MCP app tools stay caller-owned without a native search control", () => {
+  const tools = [{ type: "namespace", name: "mcp__codex_app", defer_loading: true, tools: [
+    { type: "function", name: "list_projects", parameters: { type: "object", properties: {} } },
+    { type: "function", name: "create_thread", parameters: {
+      type: "object", properties: { prompt: { type: "string" } }, required: ["prompt"],
+    } },
+  ] }];
+  for (const provider of ["grok-oauth", "groq", "deepseek"]) {
+    const surface = chatProviderToolSurface(tools, provider);
+    assert.deepEqual(surface.tools.map(tool => tool.name),
+      ["mcp__codex_app__list_projects", "mcp__codex_app__create_thread"]);
+    assert.deepEqual(surface.tools[1].parameters.required, ["prompt"]);
+    const restored = rewriteNamespaceResponsePayload({ output: [{ type: "function_call",
+      call_id: "call_app", name: "mcp__codex_app__create_thread", arguments: '{"prompt":"fixture"}',
+    }] }, buildNamespaceLookups(surface.namespaces));
+    assert.equal(restored.output[0].name, "create_thread");
+    assert.equal(restored.output[0].namespace, "mcp__codex_app");
+  }
+});
+
+test("every automation operation survives eager, discovered and deferred strict-provider surfaces", () => {
+  const automation = CODEX_APP_TOOLS.flatMap((namespace) => namespace.tools || [])
+    .find((tool) => tool.name === "automation_update");
+  const original = structuredClone(automation.inputSchema);
+  for (const mode of ["eager", "discovered", "deferred"]) {
+    const declaration = { type: "namespace", name: "mcp__codex_app", tools: [
+      { ...automation, ...(mode === "deferred" ? { defer_loading: true } : {}) },
+    ] };
+    const input = mode === "discovered" ? [
+      { type: "tool_search_call", call_id: "search", execution: "client", arguments: { query: "automation" } },
+      { type: "tool_search_output", call_id: "search", status: "completed", execution: "client", tools: [declaration] },
+    ] : mode === "deferred" ? [
+      { type: "function_call", namespace: "mcp__codex_app", name: "automation_update", call_id: "old", arguments: '{"mode":"delete","id":"fixture"}' },
+    ] : [];
+    for (const provider of ["kimi-oauth", "kimi-api", "kimi-api-cn", "opencode-go", "deepseek", "grok-api"]) {
+      const surface = chatProviderToolSurface([clientToolSearch(), ...(mode === "discovered" ? [] : [declaration])],
+        provider, { input, upstreamModel: "kimi-k2.7-code" });
+      const options = moonshotSchemaRoute(provider, "kimi-k2.7-code")
+        ? { inlineForeignRefs: true, declareTypes: true } : {};
+      const initial = repairToolSchemaRoots(surface.tools, options);
+      const searched = flattenToolSearchHistory(input, initial, surface.namespaces);
+      const repaired = repairToolSchemaRoots(searched.tools, options);
+      const tool = repaired.find((item) => item.name === "mcp__codex_app__automation_update");
+      assert.ok(tool, `${provider}/${mode}`);
+      const modeSchema = tool.parameters.properties.mode;
+      assert.equal(modeSchema.type, "string", "Moonshot receives a typed finite domain, not a new untyped ref union");
+      const domains = (modeSchema.anyOf || [modeSchema]).flatMap((branch) => grokLiteralDomain(branch, tool.parameters) || []);
+      assert.deepEqual([...new Set(domains)].sort(), ["create", "delete", "suggested_create", "suggested_update", "update", "view"], `${provider}/${mode}`);
+      assert.equal(tool.parameters.additionalProperties, false);
+      assert.deepEqual(tool.inputSchema, original, "execution retains the complete original branch constraints");
+    }
+  }
+  assert.deepEqual(automation.inputSchema, original);
 });

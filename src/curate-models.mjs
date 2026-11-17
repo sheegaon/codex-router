@@ -28,6 +28,7 @@ import {
   curatedModelContextLength,
   curatedModelDescription,
   curatedModelInputModalities,
+  curatedModelOutputLimit,
   curatedModelProviderId,
   curatedModelReasoningLevels,
   curatedModelRequestProfile,
@@ -138,12 +139,38 @@ export function advertisedModelDescription(providerId, fields) {
   return `User-curated ${providerId} model; ${named} as advertised by the provider's catalog at curation time.`;
 }
 
-export function curatedSizing(contextLength) {
+// The compaction threshold and the window it compacts inside have to leave
+// room for a full-length completion: a completion that runs past the window
+// the entry declares is a turn that overruns the context it was given. The
+// ratio alone does not guarantee that, because the ratio is fixed and an
+// output limit is not -- `minimax-m3.1-flash-free` publishes a 1,000,000-token
+// window and a 512,000-token output limit, and 0.85 of that window leaves
+// 150,000 tokens against a completion that may run to 512,000.
+//
+// So when the id publishes an output limit, the threshold is the lower of the
+// ratio's threshold and the one that keeps that limit in reserve. Without an
+// output limit there is nothing to reserve against, and the ratio stands.
+export function curatedSizing(contextLength, outputLimit) {
   if (!Number.isInteger(contextLength) || contextLength < 1) return undefined;
+  const ratio = Math.floor(contextLength * AUTO_COMPACT_RATIO);
+  if (!Number.isInteger(outputLimit) || outputLimit < 1) {
+    return {
+      contextWindow: contextLength,
+      autoCompact: ratio,
+    };
+  }
+  const reserved = Math.min(ratio, contextLength - outputLimit);
   return {
     contextWindow: contextLength,
-    autoCompact: Math.floor(contextLength * AUTO_COMPACT_RATIO),
+    autoCompact: Math.max(1, reserved),
   };
+}
+
+export function documentedSizing(providerId, upstreamModel) {
+  return curatedSizing(
+    curatedModelContextLength(providerId, upstreamModel),
+    curatedModelOutputLimit(providerId, upstreamModel),
+  );
 }
 
 function usage() {
@@ -264,9 +291,7 @@ export function normalizeCurationModels(models, providerId) {
     const untuned =
       routed.contextWindow === DEFAULT_CONTEXT_WINDOW &&
       routed.autoCompact === DEFAULT_AUTO_COMPACT;
-    const documented = curatedSizing(
-      curatedModelContextLength(providerId, model.upstreamModel),
-    );
+    const documented = documentedSizing(providerId, model.upstreamModel);
     const upgradeSizing = Boolean(documented) && untuned;
     // The same upgrade for the effort ladder: high-only is what curation
     // stores when nothing documents the model's efforts, so replacing it with
@@ -519,7 +544,7 @@ async function main() {
     // free-model size is the fallback for its id-only Zen catalog; every other
     // silent catalog still gets the conservative generic default.
     const advertised = curatedSizing(discovery.contextLengths?.[id]);
-    const documented = curatedSizing(curatedModelContextLength(providerId, id));
+    const documented = documentedSizing(providerId, id);
     const sizing = advertised || documented;
     if (sizing) Object.assign(metadata, sizing);
     // OpenCode publishes an effort ladder per free id where the route has one,
@@ -557,6 +582,7 @@ async function main() {
     // figure needs no note; it is first-hand and already labeled "advertised".
     let omitContextNote = Boolean(advertised);
     let omitReasoningNote = Boolean(flagEfforts);
+    let modalitiesOverridden = false;
     const describe = () => {
       if (!documented && !documentedEfforts) {
         // Nothing documented, but the provider's own catalog may have sized
@@ -564,10 +590,12 @@ async function main() {
         // metadata a conservative default; that stops being true here.
         const advertisedFields = [
           advertised ? "context window" : undefined,
-          advertisedModalities.length > 0 ? "input modalities" : undefined,
+          !modalitiesOverridden && advertisedModalities.length > 0 ? "input modalities" : undefined,
         ].filter(Boolean);
         if (advertisedFields.length > 0) {
           metadata.description = advertisedModelDescription(providerId, advertisedFields);
+        } else {
+          delete metadata.description;
         }
         return;
       }
@@ -597,13 +625,9 @@ async function main() {
       if (context !== documented?.contextWindow) omitContextNote = true;
     }
     const defaultImage = (metadata.inputModalities || []).includes("image");
-    if (confirm(`  Does ${id} accept image input?`, defaultImage)) {
-      metadata.inputModalities = ["text", "image"];
-    } else if (documentedModalities) {
-      // Documented modalities were pre-filled above; an explicit no has to
-      // clear them or the stored entry would still advertise image paste.
-      metadata.inputModalities = ["text"];
-    }
+    const acceptsImage = confirm(`  Does ${id} accept image input?`, defaultImage);
+    metadata.inputModalities = acceptsImage ? ["text", "image"] : ["text"];
+    modalitiesOverridden = acceptsImage !== defaultImage;
     if (!flagEfforts) {
       const ladder = metadata.reasoningLevels?.map((level) => level.effort).join(",") || "high";
       const rawEfforts = promptLine(

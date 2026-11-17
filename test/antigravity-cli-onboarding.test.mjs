@@ -204,7 +204,9 @@ test("the Antigravity probe refuses misspelled consent and provisioning flags", 
 });
 
 test("installation docs publish the operator-client login and explicit probe", () => {
-  for (const file of ["README.md", path.join("docs", "INSTALL.md")]) {
+  const readme = readFileSync(path.join(root, "README.md"), "utf8");
+  assert.match(readme, /\(docs\/PROVIDERS\.md\)/);
+  for (const file of [path.join("docs", "PROVIDERS.md"), path.join("docs", "INSTALL.md")]) {
     const contents = readFileSync(path.join(root, file), "utf8");
     assert.match(contents, /Google OAuth \*\*Desktop app\*\*/);
     assert.match(contents, /\.\/bin\/model-router codex providers login antigravity-oauth/);
@@ -242,7 +244,7 @@ test("desktop onboarding keeps the Antigravity probe explicit on every platform"
   assert.match(page, /setup\.disconnectable/);
   assert.match(tray, /case "probe": return routerLocalized\("Test & Enable"\)/);
   assert.match(tray, /setup\?\.disconnectable == true/);
-  assert.match(startup, /const antigravityStartup = antigravityOAuthStartupState\(\)/);
+  assert.match(startup, /const antigravityStartup = COMPATIBILITY_LAYER.enabled \? antigravityOAuthStartupState\(\) : \{\}/);
   assert.match(startup, /attemptAntigravityProbePromotionAfterReadiness/);
   assert.match(startup, /\.\.\.\(antigravityForwarder/);
   const providers = readFileSync(path.join(root, "src", "providers.mjs"), "utf8");

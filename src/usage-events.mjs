@@ -166,11 +166,9 @@ export function recordUsageEvent({
   // explicitly if the retry also reaches the limit; historical routers used
   // `emptyCompletionGuardReleased` for the old fail-open behavior above.
   emptyCompletionPreludeLimit,
-  // Present only when the router replaced an upstream `input_tokens: 0` with
-  // its own estimate on the way to Codex (#95). The reported counts above stay
-  // exactly as the provider sent them, so an estimated turn is never mistaken
-  // for the provider having recovered -- and a run of these events is the
-  // signal that it has not.
+  // Client context estimate substituted for a missing zero count (#95) or
+  // Grok's cumulative agentic input billing. Raw provider counts above remain
+  // unchanged for metering; this value is not a measured provider token count.
   estimatedInputTokens,
   // True when the router canceled a request at its separately configured
   // execution deadline. Activity-record retention never sets this field.
@@ -218,6 +216,7 @@ export function recordUsageEvent({
   // Router-generated correlation id. Matches /activity's `requestId`. Optional so
   // historical rows keep their exact shape.
   requestId,
+  requestKind,
   // Grok OAuth 4.6 ingress UTF-8 JSON byte split. Optional, bounded, and never
   // a token estimate. Missing payload fields measure as zero.
   contextBytes,
@@ -225,15 +224,22 @@ export function recordUsageEvent({
   reasoningEffort,
   providerToolCount,
   providerToolSchemaBytes,
+  // The free/auto pool this row's attempt belonged to, and why the pool moved
+  // past it. Absent on every row outside the pool.
+  freePool,
+  freePoolReason,
   at = Date.now(),
 }) {
   const diagnostics = usageDiagnosticMetadata({
     requestId,
+    requestKind,
     contextBytes,
     grokStructuredPatch,
     reasoningEffort,
     providerToolCount,
     providerToolSchemaBytes,
+    freePool,
+    freePoolReason,
   });
   const event = {
     ...serviceTierMetadata({
@@ -572,11 +578,14 @@ export function recentUsageEvents({
         const searchResults = safeTokenCount(event.searchResults);
         const diagnostics = usageDiagnosticMetadata({
           requestId: event.requestId,
+          requestKind: event.requestKind,
           contextBytes: event.contextBytes,
           grokStructuredPatch: event.grokStructuredPatch,
           reasoningEffort: event.reasoningEffort,
           providerToolCount: event.providerToolCount,
           providerToolSchemaBytes: event.providerToolSchemaBytes,
+          freePool: event.freePool,
+          freePoolReason: event.freePoolReason,
         });
         return {
           ...serviceTierMetadata(event),
@@ -588,6 +597,10 @@ export function recentUsageEvents({
           // series per subscription.
           provider: canonicalProviderId(safeText(event.provider, "unknown")),
           status: Number.isInteger(event.status) ? event.status : 0,
+          // The free/auto usage view counts fallbacks from this field.
+          ...(typeof event.failoverFrom === "string" && event.failoverFrom.trim()
+            ? { failoverFrom: safeText(event.failoverFrom, "unknown") }
+            : {}),
           ...(safeUpstreamAttempts(event.upstreamAttempts) ? { upstreamAttempts: safeUpstreamAttempts(event.upstreamAttempts) } : {}),
           ...(["at-most-once", "availability"].includes(event.deliveryPolicy) ? { deliveryPolicy: event.deliveryPolicy } : {}),
           ...(Number.isInteger(event.httpStatus) && event.httpStatus >= 100 && event.httpStatus <= 599 ? { httpStatus: event.httpStatus } : {}),

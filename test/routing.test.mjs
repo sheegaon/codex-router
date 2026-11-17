@@ -7,6 +7,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -30,6 +31,28 @@ import { preservedGeminiSchemas, zillowRangeSchema } from "./fixtures/gemini-too
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INTERNAL_KEY = "test-internal-service-key-with-sufficient-length";
 const CALLER_KEY = "test-router-caller-capability-with-sufficient-length";
+
+// Run the public reader against this test's committed snapshot. Routing tests
+// must prove local readback just as a real client does; a fabricated token or
+// an internal aging override would miss the permission gate being exercised.
+function readbackHistory(stateDir, callId, toolName = "exec_command") {
+  const store = path.join(stateDir, "retained-tool-results");
+  const file = readdirSync(store).find(name => name.endsWith(".result") &&
+    JSON.parse(readFileSync(path.join(store, name), "utf8")).callId === callId);
+  assert.ok(file, "router did not commit the expected snapshot");
+  const args = [path.join(root, "src", "tool-result-read.mjs"), file.slice(0, -7),
+    "--store", store, "--limit", "1"];
+  const output = execFileSync(process.execPath, args, {
+    encoding: "utf8", timeout: 20_000, windowsHide: true,
+    env: { ...process.env, MODEL_ROUTER_STATE_DIR: stateDir },
+  });
+  assert.equal(typeof JSON.parse(output).readbackProof, "string");
+  return [
+    { type: "function_call", call_id: "readback", name: toolName,
+      arguments: JSON.stringify({ cmd: [process.execPath, ...args].join(" ") }) },
+    { type: "function_call_output", call_id: "readback", output },
+  ];
+}
 
 function routerBase(port) {
   return callerBaseUrl(port, CALLER_KEY);
@@ -82,16 +105,28 @@ function run(script, env, { nodeArgs = [] } = {}) {
     env?.MODEL_ROUTER_STATE_DIR || env?.CODEX_ROUTER_STATE_DIR
       ? {}
       : { MODEL_ROUTER_STATE_DIR: mkdtempSync(path.join(os.tmpdir(), "routing-state-")) };
+  const isolatedState = env?.MODEL_ROUTER_STATE_DIR || env?.CODEX_ROUTER_STATE_DIR || stateIsolation.MODEL_ROUTER_STATE_DIR;
   const child = spawnNodeFixture(path.join(root, "src", script), {
     nodeArgs,
     cwd: root,
     env: {
       ...process.env,
       ...stateIsolation,
+      MODEL_ROUTER_STATE_DIR: isolatedState,
+      CODEX_ROUTER_STATE_DIR: isolatedState,
+      CODEX_HOME: path.join(isolatedState, "codex"),
+      ...(script === "router.mjs" && env?.CODEX_ROUTER_GATEWAY_BASE_URL ? {
+        CODEX_ROUTER_API_BASE_URL: env.CODEX_ROUTER_GATEWAY_BASE_URL,
+      } : {}),
       CODEX_ROUTER_CALLER_KEY: CALLER_KEY,
       CODEX_ROUTER_INTERNAL_KEY: INTERNAL_KEY,
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1",
+      // Router-only tests provide one owned dependency-health stand-in.
+      ...(script === "router.mjs" && env?.CODEX_ROUTER_GATEWAY_HEALTH_URL ? {
+        MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: new URL(env.CODEX_ROUTER_GATEWAY_HEALTH_URL).port,
+        MODEL_ROUTER_DEVIN_CLI_PORT: new URL(env.CODEX_ROUTER_GATEWAY_HEALTH_URL).port,
+      } : {}),
       ...env,
     },
   });
@@ -267,6 +302,46 @@ test("the Grok OAuth forwarder is probed only when its provider is enabled", asy
   }
 });
 
+test("selected Antigravity and Devin listeners must be healthy", async () => {
+  const healthy = await mockServer((_request, response) => json(response, 200, { ok: true }));
+  try {
+    for (const [provider, variable, field] of [
+      ["antigravity-oauth", "MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT", "antigravityOauth"],
+      ["devin-cli", "MODEL_ROUTER_DEVIN_CLI_PORT", "devinCli"],
+    ]) {
+      for (const reachable of [true, false]) {
+        const state = mkdtempSync(path.join(os.tmpdir(), "selected-listener-health-"));
+        writeFileSync(path.join(state, "enabled-providers.json"), JSON.stringify({ version: 1, providers: [provider] }));
+        const registry = path.join(state, "registry.json");
+        writeFileSync(registry, JSON.stringify({ version: 1,
+          providers: [{ id: provider, displayName: "Fixture", ownedBy: "fixture", kind: "oauth", proxyBaseEnv: "FIXTURE_PROXY_BASE" }],
+          models: [{ slug: `${provider}/fixture`, gatewayModel: "fixture", upstreamModel: "fixture", provider,
+            listed: true, displayName: "Fixture", description: "Synthetic health route", contextWindow: 128000,
+            autoCompact: 110000, priority: 1, defaultEffort: "medium", compHash: "fixture",
+            reasoningLevels: [{ effort: "medium", description: "Fixture" }], inputModalities: ["text"] }],
+        }));
+        const port = await openPort();
+        const router = run("router.mjs", {
+          CODEX_ROUTER_PORT: String(port), CODEX_ROUTER_STATE_DIR: state, MODEL_ROUTER_REGISTRY: registry,
+          CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${healthy.port}/health`,
+          [variable]: String(reachable ? healthy.port : await openPort()),
+        });
+        try {
+          await waitFor(`${routerBase(port)}/models`, router);
+          const response = await fetch(`${routerBase(port)}/health`);
+          const payload = await response.json();
+          assert.equal(response.status, reachable ? 200 : 503, JSON.stringify(payload));
+          assert.equal(payload[field].reachable, reachable);
+          assert.deepEqual(payload.degraded, reachable ? [] : [field]);
+        } finally {
+          await stopChild(router);
+          rmSync(state, { recursive: true, force: true });
+        }
+      }
+    }
+  } finally { await closeServer(healthy.server); }
+});
+
 test("router requires the configured path capability before any model route", async () => {
   const sessionDirectory = mkdtempSync(path.join(os.tmpdir(), "model-router-session-"));
   const sessionIndex = path.join(sessionDirectory, "session_index.jsonl");
@@ -437,19 +512,19 @@ test("router requires the configured path capability before any model route", as
     assert.doesNotMatch(router.testErrors(), new RegExp(errorSentinel));
 
     const publicHealth = await fetch(`http://127.0.0.1:${routerPort}/health`);
-    assert.equal(publicHealth.status, 200);
+    assert.equal(publicHealth.status, 200, await publicHealth.clone().text());
     const publicPayload = await publicHealth.json();
     assert.deepEqual(
       Object.keys(publicPayload).sort(),
-      ["activity", "degraded", "ok", "service", "version"],
+      ["activity", "compatibilityLayer", "degraded", "ok", "service", "version"],
     );
     // `degraded` names which local service is unreachable so doctor can say the
     // gateway died rather than "the router is not ready". It is a closed set of
-    // three fixed local service names -- never a URL, a credential, or the
+    // fixed local service names -- never a URL, a credential, or the
     // per-service payloads the protected leaf carries.
     assert.ok(
       publicPayload.degraded.every((name) =>
-        ["oauth", "api", "grokOauth", "gateway"].includes(name)),
+        ["oauth", "api", "grokOauth", "gateway", "antigravityOauth", "devinCli"].includes(name)),
       JSON.stringify(publicPayload.degraded),
     );
     assert.equal(publicPayload.activity.state, "error");
@@ -1033,7 +1108,8 @@ test("native tool-result aging is opt-in and rewrites only consumed old results"
         Authorization: "Bearer CODEX_CALLER_SECRET",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model: "gpt-5.6-sol", input }),
+      body: JSON.stringify({ model: "gpt-5.6-sol",
+        tools: [{ type: "function", name: "shell", parameters: { type: "object", properties: {} } }], input }),
     });
   const send = async (routerPort) => sendInput(routerPort, agableInput);
 
@@ -1052,8 +1128,8 @@ test("native tool-result aging is opt-in and rewrites only consumed old results"
     await stopChild(defaultRouter);
   }
 
-  // Opted in: the blob becomes a receipt, the newest results stay intact,
-  // and the usage event records the savings.
+  // Opted in: preserve the full blob until the client proves readback. Only
+  // then may a receipt replace it and a usage event record savings.
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "native-aging-state-"));
   writeFileSync(
     path.join(stateDir, "tool-result-aging.json"),
@@ -1070,15 +1146,20 @@ test("native tool-result aging is opt-in and rewrites only consumed old results"
   try {
     await waitFor(`${routerBase(agingPort)}/models`, agingRouter);
     assert.equal((await send(agingPort)).status, 200);
+    const pending = nativeRequests.at(-1).body.input[1].output;
+    assert.ok(pending.startsWith(bigOutput), "unverified readback must preserve the full result");
+    assert.match(pending, /Router archive readback pending/u);
+    const proof = readbackHistory(stateDir, "call-old", "shell");
+    assert.equal((await sendInput(agingPort, [...agableInput, ...proof])).status, 200);
     const forwarded = nativeRequests.at(-1).body.input;
     assert.match(forwarded[1].output, /^\[Older tool result compacted by Codex Router/);
     assert.match(forwarded[1].output, /sha256:[0-9a-f]{64}/);
-    assert.equal(forwarded.at(-1).output, "small result 4");
+    assert.equal(forwarded.find(item => item.call_id === "call-4").output, "small result 4");
 
     // Remote compaction V2 arrives on the ordinary Responses endpoint. Even
     // when the operator opted native turns into aging, the summary must read
     // the original tool output rather than the router's compact receipt.
-    const compactInput = [...agableInput, { type: "compaction_trigger" }];
+    const compactInput = [...agableInput, ...proof, { type: "compaction_trigger" }];
     assert.equal((await sendInput(agingPort, compactInput)).status, 200);
     const compactForwarded = nativeRequests.at(-1).body.input;
     assert.equal(compactForwarded[1].output, bigOutput);
@@ -1653,6 +1734,7 @@ test("router relays encrypted Codex subagent payloads before external routing", 
         item_id: "fc_relay",
         arguments: relayArguments,
       },
+      { type: "response.completed", response: { status: "completed", output: [] } },
     ];
     const event = `${relayEvents
       .map((entry) => `event: ${entry.type}\ndata: ${JSON.stringify(entry)}\n\n`)
@@ -1683,6 +1765,8 @@ test("router relays encrypted Codex subagent payloads before external routing", 
         Authorization: "Bearer CHATGPT_SESSION_TOKEN",
         "ChatGPT-Account-Id": "account-id",
         "Content-Type": "application/json",
+        "x-openai-internal-codex-responses-lite": "true",
+        "x-codex-turn-state": "parent-turn-affinity",
       },
       body: JSON.stringify({
         model: "kimi-oauth/k3",
@@ -1706,6 +1790,8 @@ test("router relays encrypted Codex subagent payloads before external routing", 
 
     assert.equal(response.status, 200, await response.text());
     assert.equal(nativeRequests.length, 1);
+    assert.equal(nativeRequests[0].headers["x-openai-internal-codex-responses-lite"], undefined);
+    assert.equal(nativeRequests[0].headers["x-codex-turn-state"], undefined);
     assert.equal(nativeRequests[0].headers.authorization, "Bearer CHATGPT_SESSION_TOKEN");
     assert.equal(nativeRequests[0].headers["chatgpt-account-id"], "account-id");
     assert.equal(nativeRequests[0].body.model, "gpt-5.6-sol");
@@ -1859,12 +1945,20 @@ test("router preserves relay 401 so Codex can refresh authentication", async () 
   }
 });
 
-test("router preserves relay 429 and suppresses repeated native attempts per account", async () => {
+for (const sseError of [false, true]) {
+test(`router preserves relay 429 and suppresses repeated native attempts per account (${sseError ? "SSE" : "HTTP"})`, async () => {
   let nativeRequests = 0;
   const native = await mockServer(async (request, response) => {
     nativeRequests += 1;
     await bodyJson(request);
-    json(response, 429, { error: { message: "native relay quota exhausted" } });
+    if (sseError) {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.end(`data: ${JSON.stringify({ type: "error", error: {
+        code: "rate_limit_exceeded", message: "native relay quota exhausted",
+      } })}\n\n`);
+    } else {
+      json(response, 429, { error: { message: "native relay quota exhausted" } });
+    }
   });
   let gatewayRequests = 0;
   const gateway = await mockServer(async (_request, response) => {
@@ -1931,6 +2025,7 @@ test("router preserves relay 429 and suppresses repeated native attempts per acc
     await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
   }
 });
+}
 
 test("router sends standalone image requests only to the native OpenAI backend", async () => {
   const nativeRequests = [];
@@ -2491,8 +2586,8 @@ test("router synthesizes routed compaction and safely replays it to native model
     assert.equal(gatewayRequests[0].body.input[1].type, "custom_tool_call");
     assert.equal(gatewayRequests[0].body.input[1].name, "apply_patch");
     assert.equal(gatewayRequests[0].body.input[2].type, "custom_tool_call_output");
-    assert.match(gatewayRequests[0].body.input.at(-2).content[0].text, /ROUTER SOURCE CATALOG/);
-    assert.match(gatewayRequests[0].body.input.at(-1).content[0].text, /Return exactly one JSON object/);
+    assert.match(gatewayRequests[0].body.input.at(-1).content[0].text, /ROUTER SOURCE CATALOG/);
+    assert.match(gatewayRequests[0].body.instructions, /Return exactly one JSON object/);
 
     const v2 = await routed([...input, { type: "compaction_trigger" }], { stream: false });
     assert.equal(v2.status, 200);
@@ -2762,6 +2857,149 @@ test("router synthesizes routed compaction and safely replays it to native model
   } finally {
     await stopChild(router);
     await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+  }
+});
+
+test("routed compaction requires a successful terminal before replacing history", async () => {
+  let source;
+  let submissions = 0;
+  let quotaRefusal;
+  let jsonReply = false;
+  let jsonStatus;
+  const gateway = await mockServer(async (request, response) => {
+    const body = await bodyJson(request);
+    submissions += 1;
+    if (quotaRefusal) {
+      if (body.model === "deepseek-v4-pro") {
+        if (quotaRefusal === "sse") {
+          response.writeHead(429, { "Content-Type": "text/event-stream" });
+          response.end('data: {"type":"error","message":"Usage limit reached"}\n\n');
+        } else {
+          json(response, 429, { error: { message: "Usage limit reached" } });
+        }
+      } else {
+        json(response, 200, { output_text: "A complete fallback summary." });
+      }
+      return;
+    }
+    if (jsonReply) {
+      json(response, 200, {
+        output_text: "PARTIAL_COMPACTION_JSON",
+        usage: { input_tokens: 37, output_tokens: 3 },
+        ...(jsonStatus === undefined ? {} : { status: jsonStatus }),
+      });
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(source);
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "compaction-terminal-evidence-"));
+  writeFileSync(path.join(stateDir, "deepseek-api-key.secret"), "TEST_DEEPSEEK_KEY\n");
+  writeFileSync(path.join(stateDir, "xai-api-key.secret"), "TEST_XAI_KEY\n");
+  writeFileSync(path.join(stateDir, "enabled-providers.json"), JSON.stringify({ version: 1, providers: ["deepseek", "grok-api"] }));
+  writeFileSync(path.join(stateDir, "failover.json"), JSON.stringify({ version: 1, enabled: true, chain: ["grok-api/grok-4.5"] }));
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    DEEPSEEK_API_KEY: "TEST_DEEPSEEK_KEY", XAI_API_KEY: "TEST_XAI_KEY",
+    CODEX_ROUTER_NO_DISCOVERY: "0",
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const terminal = (status) => ({ type: "response.completed", response: {
+    id: "resp_summary", status,
+    usage: { input_tokens: 37, output_tokens: 3 },
+    output: [{ type: "message", content: [{ type: "output_text", text: "A complete summary." }] }],
+  } });
+  const delta = { type: "response.output_text.delta", delta: "A partial summary" };
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    for (const [events, expected] of [
+      [[delta], 502],
+      [[delta, terminal("incomplete")], 502],
+      [[delta, terminal("failed")], 502],
+      [[delta, terminal("in_progress")], 502],
+      [[delta, terminal("unknown")], 502],
+      [[delta, { type: "response.completed", response: [] }], 502],
+      [[delta, { type: "response.cancelled" }], 502],
+      [[delta, { type: "response.incomplete", response: { status: "incomplete", usage: { input_tokens: 37, output_tokens: 3 } } }], 502],
+      [[delta, { type: "response.usage", usage: { input_tokens: 37, output_tokens: 3 } }], 502],
+      [[delta, { type: "error", error: { message: "synthetic failure" } }], 502],
+      [[delta, { type: "response.failed" }, terminal("completed")], 502],
+      [[delta, terminal("completed")], 200],
+      [[terminal(undefined)], 200],
+      [[{ ...terminal("completed"), type: "response.done" }], 200],
+      [[delta, { type: "provider_transport_error" }], 502],
+      [[delta, { type: "context_length_exceeded: maximum context length is 1000000 tokens" }], 502],
+    ]) {
+      source = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+      for (const v1 of [false, true]) {
+        const before = submissions;
+        const response = await fetch(`${routerBase(routerPort)}/responses${v1 ? "/compact" : ""}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", stream: false, input: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "Preserve the actual task." }] },
+            ...(!v1 ? [{ type: "compaction_trigger" }] : []),
+          ] }),
+        });
+        const text = await response.text();
+        assert.equal(response.status, expected, text);
+        assert.equal(submissions - before, 1, "partial generation diagnostics cannot authorize replay");
+        if (expected !== 200) {
+          assert.doesNotMatch(text, /kcr2:|BEGIN_CODEX_ROUTER_CHECKPOINT/);
+          if (events.some((event) => event.response?.usage || event.usage)) {
+            const metered = await waitForUsageEvents(stateDir, submissions, router);
+            assert.equal(metered.at(-1).inputTokens, 37);
+            assert.equal(metered.at(-1).outputTokens, 3);
+            assert.equal(metered.at(-1).generationOutcome, "failed");
+          }
+        }
+      }
+    }
+    jsonReply = true;
+    for (jsonStatus of ["incomplete", "failed", "in_progress", "cancelled", "unknown", "completed", undefined]) {
+      for (const v1 of [false, true]) {
+        const before = submissions;
+        const response = await fetch(`${routerBase(routerPort)}/responses${v1 ? "/compact" : ""}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", input: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "Preserve the actual task." }] },
+            ...(!v1 ? [{ type: "compaction_trigger" }] : []),
+          ] }),
+        });
+        const text = await response.text();
+        const valid = jsonStatus === undefined || jsonStatus === "completed";
+        assert.equal(response.status, valid ? 200 : 502, `JSON ${jsonStatus}: ${text}`);
+        assert.equal(submissions - before, 1, "an explicit incomplete status cannot authorize replay");
+        if (!valid) {
+          assert.doesNotMatch(text, /kcr2:|BEGIN_CODEX_ROUTER_CHECKPOINT|PARTIAL_COMPACTION_JSON/);
+          const events = await waitForUsageEvents(stateDir, submissions, router);
+          assert.equal(events.at(-1).inputTokens, 37);
+          assert.equal(events.at(-1).outputTokens, 3);
+          assert.equal(events.at(-1).generationOutcome, "failed");
+        }
+      }
+    }
+    jsonReply = false;
+    // Explicit HTTP refusals keep their original status and intentional fallback,
+    // regardless of whether the refusal body is JSON or SSE.
+    for (quotaRefusal of ["sse", "json"]) {
+      const before = submissions;
+      const fallback = await fetch(`${routerBase(routerPort)}/responses/compact`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "Preserve the actual task." }] },
+        ] }),
+      });
+      assert.equal(fallback.status, 200, await fallback.text());
+      assert.equal(submissions - before, 2, `HTTP 429 ${quotaRefusal}: alternative is genuinely available`);
+    }
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(stateDir, { recursive: true, force: true });
   }
 });
 
@@ -4686,7 +4924,7 @@ test("API forwarder downgrades forced tool choices for DeepSeek thinking models"
   }
 });
 
-test("API forwarder coalesces consecutive assistant messages so tool results follow tool calls", async () => {
+test("API forwarder folds assistant tool history without discarding reasoning or vendor metadata", async () => {
   const upstreamRequests = [];
   const upstream = await mockServer(async (request, response) => {
     upstreamRequests.push({ headers: request.headers, body: await bodyJson(request) });
@@ -4726,21 +4964,40 @@ test("API forwarder coalesces consecutive assistant messages so tool results fol
           model: "deepseek-v4-pro",
           messages: [
             { role: "user", content: "run it" },
-            { role: "assistant", tool_calls: [toolCall] },
-            { role: "assistant", content: "Running the command now." },
+            { role: "assistant", reasoning_content: "first thought", tool_calls: [toolCall] },
+            { role: "assistant", content: "Running the command now.", reasoning_content: "second thought", vendor_state: { signature: "synthetic-signature" } },
             { role: "tool", tool_call_id: "call_A", content: "done" },
           ],
         }),
       },
     );
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 200, await response.text());
     const messages = upstreamRequests[0].body.messages;
     assert.equal(messages.length, 3);
     assert.equal(messages[1].role, "assistant");
     assert.equal(messages[1].content, "Running the command now.");
     assert.deepEqual(messages[1].tool_calls, [toolCall]);
+    assert.equal(messages[1].reasoning_content, "first thought\nsecond thought");
+    assert.deepEqual(messages[1].vendor_state, { signature: "synthetic-signature" });
     assert.equal(messages[2].role, "tool");
     assert.equal(messages[2].tool_call_id, "call_A");
+
+    // Different opaque signatures cannot be represented on one assistant
+    // message. Preserve that history and its real result instead of inventing
+    // a merged signature or a replacement tool result.
+    const conflicting = [
+      { role: "user", content: "run it" },
+      { role: "assistant", tool_calls: [toolCall], reasoning_content: "first thought", vendor_state: { signature: "first" } },
+      { role: "assistant", content: "Running the command now.", vendor_state: { signature: "second" } },
+      { role: "tool", tool_call_id: "call_A", content: "actual result" },
+    ];
+    const ambiguous = await fetch(`http://127.0.0.1:${forwarderPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "deepseek-v4-pro", messages: conflicting }),
+    });
+    assert.equal(ambiguous.status, 200);
+    assert.deepEqual(upstreamRequests.at(-1).body.messages, conflicting);
   } finally {
     await stopChild(forwarder);
     await closeServer(upstream.server);
@@ -7577,7 +7834,7 @@ test("router preserves orphan Codex app outputs as readable history", async () =
       /Codex app tool result: codex_app\.send_message_to_thread/u,
     );
     assert.match(JSON.stringify(gatewayRequests[1].input), /child finished/u);
-    const catalog = gatewayRequests[1].input.at(-2).content[0].text;
+    const catalog = gatewayRequests[1].input.at(-1).content[0].text;
     assert.match(catalog, /"kind":"tool_result"/u);
     assert.match(catalog, /"tool":"send_message_to_thread"/u);
     assert.doesNotMatch(catalog, /"kind":"user_message"/u);
@@ -8768,6 +9025,41 @@ test("an exhausted native reviewer moves later approvals to the configured revie
   }
 });
 
+test("an oversized native-review error survives a bounded classifier peek", async () => {
+  const diagnostic = JSON.stringify({ error: { message: "synthetic diagnostic ".repeat(64) } });
+  let submissions = 0;
+  const native = await mockServer(async (request, response) => {
+    await bodyJson(request);
+    submissions += 1;
+    response.writeHead(400, { "Content-Type": "application/json", "X-Original-Error": "preserved" });
+    response.end(diagnostic);
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_MAX_BUFFERED_RESPONSE_BYTES: "16",
+    CODEX_ROUTER_QUIET: "1",
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { Authorization: "Bearer CODEX_CALLER_SECRET", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "codex-auto-review", input: "review synthetic command" }),
+      signal: AbortSignal.timeout(3_000),
+    });
+    const actual = await response.text();
+    assert.equal(response.status, 400, actual);
+    assert.equal(response.headers.get("x-original-error"), "preserved");
+    assert.equal(actual, diagnostic);
+    assert.equal(submissions, 1);
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+  }
+});
+
 test("a native reviewer that answers keeps every approval native, deny included (#787)", async () => {
   const nativeRequests = [];
   // A `deny` is a successful review. Reading it as the provider failing would
@@ -9157,6 +9449,7 @@ test("routed compaction resolves subagent handoffs before summarizing", async ()
         item_id: "fc_relay",
         arguments: relayArguments,
       },
+      { type: "response.completed", response: { status: "completed", output: [] } },
     ];
     response.writeHead(200, { "Content-Type": "text/event-stream" });
     response.end(
@@ -9661,25 +9954,42 @@ test("router ages consumed large tool results but preserves the newest result fr
 
   try {
     await waitFor(`${routerBase(routerPort)}/models`, router);
+    const tools = [{ type: "function", name: "exec_command", parameters: { type: "object", properties: {} } }];
     const response = await fetch(`${routerBase(routerPort)}/responses`, {
       method: "POST",
       headers: {
         Authorization: "Bearer CODEX_CALLER_SECRET",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", stream: false, input }),
+      body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", stream: false, tools, input }),
     });
     assert.equal(response.status, 200, await response.text());
-    const forwarded = gatewayBodies[0].input;
+    const unverified = gatewayBodies[0].input;
+    assert.ok(unverified[1].output.startsWith(large));
+    assert.match(unverified[1].output, /Router archive readback pending/u);
+    for (let index = 0; index < 4; index += 1) {
+      assert.equal(unverified.find(item => item.call_id === `new-${index}` && item.output).output,
+        `${index}:${"n".repeat(34_000)}`);
+    }
+    const proof = readbackHistory(stateDir, "old");
+    const verifiedInput = [...input, ...proof];
+    const verified = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", stream: false, tools, input: verifiedInput }),
+    });
+    assert.equal(verified.status, 200, await verified.text());
+    const forwarded = gatewayBodies[1].input;
     assert.match(forwarded[1].output, /Older tool result compacted by Codex Router/);
     assert.match(forwarded[1].output, /old-head/);
     assert.match(forwarded[1].output, /old-tail/);
-    for (let index = 0; index < 4; index += 1) {
-      const result = forwarded.find((item) => item.call_id === `new-${index}` && item.type === "function_call_output");
-      assert.equal(result.output, `${index}:${"n".repeat(34_000)}`);
+    for (const expected of verifiedInput.filter(item => item.type === "function_call_output").slice(-4)) {
+      const result = forwarded.find(item => item.call_id === expected.call_id && item.type === "function_call_output");
+      assert.equal(result.output, expected.output);
     }
-    const [event] = await waitForUsageEvents(stateDir, 1, router);
-    assert.equal(event.toolResultsAged, 1);
+    const events = await waitForUsageEvents(stateDir, 2, router);
+    assert.equal(events[0].toolResultsAged ?? 0, 0);
+    const event = events[1];
+    assert.equal(event.toolResultsAged, 2, "the probe advanced the frontier past old and new-0");
     assert.ok(event.toolResultBytesSaved > 30_000);
 
     // Settings are read for each routed request, so a UI toggle takes effect
@@ -9695,10 +10005,10 @@ test("router ages consumed large tool results but preserves the newest result fr
         Authorization: "Bearer CODEX_CALLER_SECRET",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", stream: false, input }),
+      body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", stream: false, tools, input }),
     });
     assert.equal(exactResponse.status, 200, await exactResponse.text());
-    assert.equal(gatewayBodies[1].input[1].output, large);
+    assert.equal(gatewayBodies[2].input[1].output, large);
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -9706,7 +10016,72 @@ test("router ages consumed large tool results but preserves the newest result fr
   }
 });
 
-test("RTK shaping is reserved for routed compaction and ordinary turns keep newest results exact", async () => {
+test("per-model 16KiB policy recognizes Desktop wrapped readback and leaves other routes unchanged", async () => {
+  const bodies = [];
+  const gateway = await mockServer(async (request, response) => {
+    if (request.url === "/health") return json(response, 200, { ok: true });
+    bodies.push(await bodyJson(request));
+    json(response, 200, { output: [{ type: "message", role: "assistant", content: "ok" }] });
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-model-history-policy-"));
+  const model = "deepseek/deepseek-v4-pro";
+  writeFileSync(path.join(stateDir, "tool-result-aging.json"), JSON.stringify({
+    version: 1, enabled: true, nativeEnabled: false,
+    modelMinBytes: { [model]: 16384 }, readbackHintModels: [model],
+  }));
+  const port = await openPort();
+  const base = `http://127.0.0.1:${gateway.port}`;
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(port), MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `${base}/v1`, CODEX_ROUTER_API_BASE_URL: `${base}/v1`,
+    CODEX_ROUTER_OAUTH_HEALTH_URL: `${base}/health`, CODEX_ROUTER_API_HEALTH_URL: `${base}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `${base}/health`, CODEX_ROUTER_GATEWAY_HEALTH_URL: `${base}/health`,
+    MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: String(gateway.port), MODEL_ROUTER_DEVIN_CLI_PORT: String(gateway.port),
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const text = "head\n" + "real evidence row\n".repeat(1300) + "tail";
+  const consumed = (id, output, args = "{}") => [
+    { type: "function_call", name: "exec_command", call_id: id, arguments: args },
+    { type: "function_call_output", call_id: id, output },
+    { type: "message", role: "assistant", content: "processed" },
+  ];
+  const input = [
+    ...consumed("old16", text, '{"cmd":"original-command"}'),
+    ...Array.from({ length: 7 }, (_, i) => consumed(`medium-${i}`, text)).flat(),
+    ...Array.from({ length: 4 }, (_, i) => consumed(`new16-${i}`, "small")).flat(),
+  ];
+  const tools = [{ type: "function", name: "exec_command", parameters: { type: "object", properties: {} } }];
+  const send = async (items, selected = model) => {
+    const response = await fetch(`${routerBase(port)}/responses`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: selected, stream: false, tools, input: items }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    return bodies.at(-1).input;
+  };
+  try {
+    await waitFor(`${routerBase(port)}/models`, router);
+    const pending = await send(input);
+    assert.ok(pending[1].output.startsWith(text));
+    assert.equal(pending.at(-1).role, "developer");
+    assert.match(pending.at(-1).content[0].text, /--limit 1/u);
+    const proof = readbackHistory(stateDir, "old16");
+    proof[1].output = [{ type: "input_text", text: JSON.stringify({ exit_code: 0, output: proof[1].output }) }];
+    const aged = await send([...input, ...proof]);
+    assert.match(aged[1].output, /Older tool result compacted/u);
+    assert.equal(aged[0].arguments, input[0].arguments);
+    assert.equal(aged.filter(item => item.role === "developer").length, 0);
+    const unaffected = await send(input, "deepseek/deepseek-v4-flash");
+    assert.equal(unaffected[1].output, text);
+    assert.equal(unaffected.some(item => item.role === "developer"), false);
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("tool-less routed compaction and ordinary turns keep newest tool results exact", async () => {
   const gatewayBodies = [];
   const gateway = await mockServer(async (request, response) => {
     gatewayBodies.push(await bodyJson(request));
@@ -9769,16 +10144,15 @@ test("RTK shaping is reserved for routed compaction and ordinary turns keep newe
     assert.equal(gatewayBodies[0].input[1].output, value);
     assert.equal(gatewayBodies[0].instructions, "Base instructions.");
     assert.doesNotMatch(gatewayBodies[0].instructions, /Token maxxing pressure|decision packet|Be terse/u);
-    assert.match(gatewayBodies[1].input[1].output, /Tool result shaped by Codex Router RTK-style compaction/u);
-    assert.match(gatewayBodies[1].input[1].output, /same line repeated 109999 more times/u);
-    assert.match(gatewayBodies[1].input[1].output, /ERROR final link failed/u);
-    assert.match(gatewayBodies[1].input[1].output, /Repeat the preceding exec_command call/u);
+    assert.equal(gatewayBodies[1].input.find(item => item.type === "function_call_output" && item.call_id === "latest")?.output, value,
+      "a tool-less summarizer cannot recover omitted text and must see the original");
+    assert.deepEqual(gatewayBodies[1].tools, []);
     assert.doesNotMatch(gatewayBodies[1].instructions, /Token maxxing pressure|decision packet|Be terse/u);
 
     const events = await waitForUsageEvents(stateDir, 2, router);
     assert.equal(events[0].toolResultsShaped, undefined);
-    assert.equal(events[1].toolResultsShaped, 1);
-    assert.ok(events[1].toolResultShapeBytesSaved > 2_000_000);
+    assert.equal(events[1].toolResultsShaped ?? 0, 0);
+    assert.equal(events[1].toolResultShapeBytesSaved ?? 0, 0);
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -10536,7 +10910,8 @@ test("a subagent effort reaches child turns and leaves parent turns alone", asyn
 // provider sees it -- measured against the real LiteLLM adapter, where the
 // child turn reached the provider at the parent's effort. Drive the authentic
 // client shape so the override has to survive the same precedence.
-test("a subagent effort overrides the effort Codex nested in the reasoning object", async () => {
+for (const model of ["deepseek/deepseek-v4-pro", "grok-oauth/grok-4.7"]) {
+test(`a subagent effort overrides the effort Codex nested in the reasoning object (${model})`, async () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "subagent-effort-nested-"));
   // Written directly rather than through setSubagentEffort: paths.mjs resolves
   // the state directory once per process, so a second in-process import lands
@@ -10548,7 +10923,7 @@ test("a subagent effort overrides the effort Codex nested in the reasoning objec
       mode: "all",
       enabled: [],
       disabled: [],
-      efforts: { "deepseek/deepseek-v4-pro": "max" },
+      efforts: { [model]: "max" },
     })}\n`,
     { mode: 0o600 },
   );
@@ -10560,7 +10935,7 @@ test("a subagent effort overrides the effort Codex nested in the reasoning objec
       return;
     }
     const body = await bodyJson(request);
-    seen.push({ reasoning: body.reasoning, effort: body.reasoning_effort });
+    seen.push({ reasoning: body.reasoning, effort: body.reasoning_effort, bridge: body.extra_body });
     json(response, 200, {
       id: "resp_effort_nested",
       output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }],
@@ -10585,7 +10960,7 @@ test("a subagent effort overrides the effort Codex nested in the reasoning objec
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
       body: JSON.stringify({
-        model: "deepseek/deepseek-v4-pro",
+        model,
         input: "go",
         reasoning: { effort: "low", summary: "auto" },
       }),
@@ -10617,6 +10992,15 @@ test("a subagent effort overrides the effort Codex nested in the reasoning objec
       "the parent turn was re-tuned by a subagent setting",
     );
     assert.equal(seen[1].effort, undefined, "the parent turn grew a flat effort field");
+    if (model.startsWith("grok-oauth/")) {
+      assert.deepEqual(seen[0].bridge.reasoning_effort, { effort: "max", summary: "auto" },
+        "the Chat bridge retained the parent effort before the child override");
+      assert.deepEqual(seen[1].bridge.reasoning_effort, { effort: "low", summary: "auto" },
+        "the Chat bridge changed the parent effort");
+    } else {
+      assert.equal(seen[0].bridge?.reasoning_effort, undefined,
+        "Grok's bridge changed another provider");
+    }
   } finally {
     // See the sibling test above: removing the state directory out from under
     // a router that has been signalled but not awaited is what produced the
@@ -10626,6 +11010,8 @@ test("a subagent effort overrides the effort Codex nested in the reasoning objec
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+}
 
 // #256: spawning a subagent on opencode-go/deepseek-v4-flash made every
 // following parent request 400 with "The `reasoning_content` in the thinking
@@ -10682,16 +11068,26 @@ test("reasoning survives the replay onto tool-call and prose assistant turns ali
 
   try {
     await waitFor(`${routerBase(routerPort)}/models`, router);
+    const tools = [{ type: "function", name: "exec_command", parameters: { type: "object", properties: {} } }];
     const response = await fetch(`${routerBase(routerPort)}/responses`, {
       method: "POST",
       headers: {
         Authorization: "Bearer CODEX_CALLER_SECRET",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", stream: false, input }),
+      body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", stream: false, tools, input }),
     });
     assert.equal(response.status, 200, await response.text());
-    const forwarded = gatewayBodies[0].input;
+    const pending = gatewayBodies[0].input.find(item => item.call_id === "old" && item.output);
+    assert.ok(pending.output.startsWith("x".repeat(40_000)));
+    assert.match(pending.output, /Router archive readback pending/u);
+    const verified = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", stream: false, tools,
+        input: [...input, ...readbackHistory(stateDir, "old")] }),
+    });
+    assert.equal(verified.status, 200, await verified.text());
+    const forwarded = gatewayBodies[1].input;
     const text = (item) =>
       (Array.isArray(item?.content) ? item.content : [])
         .map((part) => (typeof part?.text === "string" ? part.text : ""))
@@ -12007,8 +12403,9 @@ test("router response pipelines preserve ambiguous provider bytes exactly", asyn
     );
     const failureText = failed.toString("utf8");
     assert.match(failureText, /"namespace":"collaboration"/u);
-    assert.match(failureText, /event: error/u);
-    assert.match(failureText, /local_router_stream_failed/u);
+    assert.match(failureText, /event: response.failed/u);
+    assert.match(failureText, /ERR_NAMESPACE_RELAY_COMMITTED_STREAM/u);
+    assert.match(failureText, /"code":"invalid_prompt"/u);
     assert.doesNotMatch(failureText, new RegExp(postCommitMarker, "u"));
     const lifecycleFailed = await turn(
       "special-lifecycle-failure",
@@ -12017,8 +12414,9 @@ test("router response pipelines preserve ambiguous provider bytes exactly", asyn
     );
     const lifecycleFailureText = lifecycleFailed.toString("utf8");
     assert.match(lifecycleFailureText, /"type":"custom_tool_call"/u);
-    assert.match(lifecycleFailureText, /event: error/u);
-    assert.match(lifecycleFailureText, /local_router_stream_failed/u);
+    assert.match(lifecycleFailureText, /event: response.failed/u);
+    assert.match(lifecycleFailureText, /ERR_NAMESPACE_RELAY_COMMITTED_STREAM/u);
+    assert.match(lifecycleFailureText, /"code":"invalid_prompt"/u);
     assert.doesNotMatch(lifecycleFailureText, new RegExp(lifecycleMarker, "u"));
   } finally {
     await stopChild(router);
@@ -12921,7 +13319,7 @@ test("Zen Free Muse bridges custom tools across JSON, history, and errors", asyn
       });
       return;
     }
-    if (inputText.includes("lossy continuation checkpoint")) {
+    if (body.instructions?.includes("lossy continuation checkpoint")) {
       if (
         body.input.some((item) =>
           ["custom_tool_call", "custom_tool_call_output"].includes(item?.type),
@@ -14189,6 +14587,142 @@ function genericResponsesReasoningFixture() {
   return { dir, providersFile, userModelsFile };
 }
 
+test("Responses child effort overrides survive the real API forwarder without a flat alias", async () => {
+  const upstreamBodies = [];
+  const upstream = await mockServer(async (request, response) => {
+    const body = await bodyJson(request);
+    upstreamBodies.push(body);
+    const answer = {
+      id: "resp_child_effort",
+      object: "response",
+      status: "completed",
+      model: body.model,
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "child ok" }] }],
+    };
+    if (body.stream) {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.end(`data: ${JSON.stringify({ type: "response.completed", response: answer })}\n\n`);
+    } else json(response, 200, answer);
+  });
+  const fixture = genericResponsesReasoningFixture();
+  const providers = JSON.parse(readFileSync(fixture.providersFile, "utf8"));
+  providers.providers[0].baseUrl = `http://127.0.0.1:${upstream.port}/v1`;
+  providers.providers[0].allowPrivate = true;
+  writeFileSync(fixture.providersFile, JSON.stringify(providers));
+  const settingsPath = path.join(fixture.dir, "multi-agent-settings.json");
+  const settings = { version: 2, mode: "all", enabled: [], disabled: [], efforts: { "responses-gateway/thinker": "max" } };
+  writeFileSync(settingsPath, JSON.stringify(settings));
+  const forwarderPort = await openPort();
+  const env = {
+    MODEL_ROUTER_STATE_DIR: fixture.dir,
+    MODEL_ROUTER_GENERIC_PROVIDERS: fixture.providersFile,
+    MODEL_ROUTER_USER_MODELS: fixture.userModelsFile,
+    CODEX_ROUTER_QUIET: "1",
+  };
+  const forwarder = run("api-forwarder.mjs", { ...env, CODEX_ROUTER_API_PORT: String(forwarderPort) });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    ...env,
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${forwarderPort}/v1`,
+  });
+  const turn = (fields, { child = true, stream = false } = {}) => fetch(`${routerBase(routerPort)}/responses`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(child ? { "x-openai-subagent": "fixture-child" } : {}),
+    },
+    body: JSON.stringify({
+      model: "responses-gateway/thinker",
+      stream,
+      input: [{ type: "agent_message", author: "/root", recipient: "/root/worker", content: [
+        { type: "input_text", text: "Message Type: NEW_TASK\nPayload:\n" },
+        { type: "encrypted_content", encrypted_content: "Review the fixture." },
+      ] }],
+      ...fields,
+    }),
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, { Authorization: `Bearer ${INTERNAL_KEY}` });
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    for (const [fields, options, expected] of [
+      [{ reasoning: { effort: "low", summary: "auto" } }, { stream: true }, { effort: "max", summary: "auto" }],
+      [{ reasoning_effort: "low" }, {}, { effort: "max" }],
+      [{ reasoning: { effort: "low", summary: "auto" }, reasoning_effort: "high" }, {}, { effort: "max", summary: "auto" }],
+      [{ reasoning: { effort: "low", summary: "auto" } }, { child: false }, { effort: "low", summary: "auto" }],
+    ]) {
+      const response = await turn(fields, options);
+      const text = await response.text();
+      assert.equal(response.status, 200, `${text}\n${router.testErrors()}\n${forwarder.testErrors()}`);
+      assert.match(text, /child ok/);
+      assert.deepEqual(upstreamBodies.at(-1).reasoning, expected);
+      assert.equal(Object.hasOwn(upstreamBodies.at(-1), "reasoning_effort"), false);
+      assert.equal(upstreamBodies.at(-1).model, "thinker");
+      assert.equal(upstreamBodies.at(-1).input[0].type, "message");
+      assert.deepEqual(upstreamBodies.at(-1).input[0].content.at(-1), { type: "input_text", text: "Review the fixture." });
+    }
+    writeFileSync(settingsPath, JSON.stringify({ ...settings, efforts: {} }));
+    const unconfigured = await turn({ reasoning: { effort: "low", summary: "auto" } });
+    assert.equal(unconfigured.status, 200, await unconfigured.text());
+    assert.deepEqual(upstreamBodies.at(-1).reasoning, { effort: "low", summary: "auto" });
+
+    // The fix is on the child override, not a relaxation of the public adapter:
+    // an ordinary request with conflicting aliases must still fail locally.
+    const seen = upstreamBodies.length;
+    const invalidParent = await turn({ reasoning: { effort: "low" }, reasoning_effort: "high" }, { child: false });
+    assert.equal(invalidParent.status, 400, await invalidParent.text());
+    assert.equal(upstreamBodies.length, seen);
+  } finally {
+    await stopChild(router);
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("built-in Responses child overrides also omit inherited flat effort aliases", async () => {
+  const models = ["meta/muse-spark-1.3", "opencode-go-responses/muse-spark-1.3-contributor"];
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "responses-child-effort-"));
+  writeFileSync(path.join(stateDir, "multi-agent-settings.json"), JSON.stringify({
+    version: 2, mode: "all", enabled: [], disabled: [],
+    efforts: Object.fromEntries(models.map((model) => [model, "max"])),
+  }));
+  const bodies = [];
+  const gateway = await mockServer(async (request, response) => {
+    bodies.push(await bodyJson(request));
+    json(response, 200, {
+      id: "resp_builtin_child_effort", object: "response", status: "completed",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+    });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    for (const model of models) {
+      const response = await fetch(`${routerBase(routerPort)}/responses`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-openai-subagent": "fixture-child" },
+        body: JSON.stringify({ model, stream: false, input: "Review the fixture.",
+          reasoning: { effort: "low", summary: "auto" }, reasoning_effort: "low" }),
+      });
+      assert.equal(response.status, 200, `${model}: ${await response.text()}`);
+      assert.deepEqual(bodies.at(-1).reasoning, { effort: "max", summary: "auto" });
+      assert.equal(Object.hasOwn(bodies.at(-1), "reasoning_effort"), false);
+    }
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("generic openai-responses routes downgrade Codex agent handoffs on turns and compaction", async () => {
   const gatewayBodies = [];
   const gateway = await mockServer(async (request, response) => {
@@ -14365,3 +14899,58 @@ for (const [label, model, generic] of [
     }
   });
 }
+
+test("Meta Muse reasoning matrix preserves effort, summaries, tools and opaque replay", async () => {
+  const { MODEL_BY_SLUG } = await import("../src/model-registry.mjs");
+  const slugs = ["muse-wonder-1.0", "muse-ember-1.0", "muse-spark-1.3", "muse-spark-1.3-contributor",
+    "muse-spark-1.2", "muse-spark-1.2-contributor", "muse-spark-1.1"];
+  const bodies = [];
+  const output = [{ type: "reasoning", id: "rs_mock", summary: [{ type: "summary_text", text: "Checked fixture." }],
+    encrypted_content: "opaque-fixture-only" },
+    { type: "function_call", id: "fc_mock", call_id: "call_next", name: "inspect", arguments: "{}", status: "completed" }];
+  const gateway = await mockServer(async (request, response) => {
+    bodies.push(await bodyJson(request));
+    json(response, 200, { id: "resp_meta_matrix", object: "response", status: "completed", output });
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "meta-reasoning-matrix-"));
+  const port = await openPort();
+  const router = run("router.mjs", { MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_PORT: String(port), CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_QUIET: "1" });
+  const replay = { type: "reasoning", id: "rs_previous", encrypted_content: "opaque-previous-fixture",
+    summary: [{ type: "summary_text", text: "Private fixture summary." }] };
+  try {
+    await waitForNodeFixture(`${routerBase(port)}/models`, router, { warmupMs: 120_000, timeoutMs: 30_000 });
+    for (const id of slugs) {
+      const model = MODEL_BY_SLUG.get(`meta/${id}`);
+      for (const { effort } of model.reasoningLevels) {
+        for (const summary of ["auto", "concise", "detailed"]) {
+          const response = await fetch(`${routerBase(port)}/responses`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model: model.slug, stream: false,
+              reasoning: { effort, summary }, include: ["reasoning.encrypted_content"],
+              tools: [{ type: "function", name: "inspect", parameters: { type: "object", properties: {} } }],
+              tool_choice: "required",
+              input: [{ role: "user", content: "Inspect the fixture." }, replay,
+                { type: "function_call", call_id: "call_previous", name: "inspect", arguments: "{}" },
+                { type: "function_call_output", call_id: "call_previous", output: "fixture result" }],
+            }),
+          });
+          assert.equal(response.status, 200, `${id}/${effort}/${summary}: ${await response.clone().text()}`);
+          const forwarded = bodies.at(-1);
+          assert.deepEqual(forwarded.reasoning, { effort, summary });
+          assert.deepEqual(forwarded.include, ["reasoning.encrypted_content"]);
+          assert.deepEqual(forwarded.input.find(item => item.type === "reasoning"), replay);
+          assert.equal(forwarded.input.at(-1).output, "fixture result");
+          assert.equal(forwarded.tools[0].name, "inspect");
+          assert.equal(forwarded.tool_choice, model.requestProfile === "auto-tool-choice" ? "auto" : "required");
+          assert.deepEqual((await response.json()).output, output);
+        }
+      }
+    }
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});

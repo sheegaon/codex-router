@@ -1,5 +1,7 @@
 # Troubleshooting
 
+English · [简体中文](zh-CN/TROUBLESHOOTING.md) · [日本語](ja/TROUBLESHOOTING.md)
+
 Start with:
 
 ```sh
@@ -377,35 +379,21 @@ line. The forwarder now accepts all three shapes and restores final tool
 arguments without holding the full turn, so Codex sees the tool call instead of
 mistaking the preceding status text for the completed task.
 
-A remaining Grok OAuth shape is a progress-only stop: the model reasons,
-emits a status sentence, and never calls a tool. On turns following a user
-message, attempt 1 still streams live; when the client offered tools and the
-short-text/token trigger fires, the forwarder retries once and appends a
-retry tool call onto the same stream. On turns following a tool result, the
-stricter certified-repair path opens the response as soon as xAI returns its
-headers and relays reasoning, but stages the short visible answer until the
-terminal event proves it is safe.
-After a conversation has exhibited that shape once, later user-message turns
-buffer only a short visible prefix up to the same text threshold. Headers and
-preceding reasoning remain live, and a tool call or longer answer releases the
-prefix; if the upstream stream aborts instead, Codex receives the terminal
-stream error without first recording another partial progress sentence. Unaffected
-conversation IDs retain the fully live path, and the evidence set is bounded
-in memory.
+A completed short answer is not evidence that Grok stalled. The forwarder
+accepts native text regardless of its length or reasoning-token count. It no
+longer repeats user-message generations based on that heuristic or remembers
+conversation IDs to buffer their later short replies. The old
+`CODEX_ROUTER_GROK_PROGRESS_ONLY_MIN_OUTPUT_TOKENS` and
+`CODEX_ROUTER_GROK_PROGRESS_ONLY_MAX_TEXT` settings no longer apply.
 
-The trigger is a shape, not a diagnosis, and it is worth knowing which turns
-pay for it. After a tool result, every no-tool prose response is held and
-repaired once — no language match, token floor, or length threshold. The
-repair must call exactly one function: either a client tool or the private
-router final-answer tool. The latter is converted to ordinary assistant text
-and never reaches Codex. A retry that does neither returns an explicit 502; it
-is never converted into a clean `stop`. After a user message the older rule
-remains: both a finished one-liner and a stalled plan retry when output tokens
-clear the floor, and the nudge offers the no-tool branch first so "Yes, that
-is correct." is not talked into a call the client would then run. Raise
-`CODEX_ROUTER_GROK_PROGRESS_ONLY_MIN_OUTPUT_TOKENS` or lower
-`CODEX_ROUTER_GROK_PROGRESS_ONLY_MAX_TEXT` to fire less often on that
-user-message path; those settings do not weaken the post-tool invariant.
+After a tool result, the forwarder still offers client tools and a private
+final-answer tool. Native completed prose is also accepted. It relays reasoning
+but holds actions until a successful terminal, so a partial action followed by
+failure cannot reach the client. Only an empty completed response with no tool
+call triggers one recovery request. That recovery must produce completed text,
+a valid private final answer, or valid client tools; otherwise it fails explicitly.
+Malformed or mixed calls and unsuccessful terminals are never repaired into
+success. Explicit caller tool choices remain authoritative.
 
 For a quiet worker, run `bin/control activity <thread-id>` from the installed
 checkout (on Windows, `codex-router.ps1 activity <thread-id>` from
@@ -428,7 +416,7 @@ whether the user or a parent agent initiated it. Wait timeouts and quiet streams
 are not authorization to replace a worker. Consult its native task state and
 confirm that the old writer has stopped before starting another.
 
-Both attempts are billed. The usage returned to Codex reports only the
+When an empty post-tool response requires recovery, both attempts are billed. The usage returned to Codex reports only the
 selected attempt's context size, while the local ledger retains the aggregate
 as billed input/output tokens. The response sets
 `progress_only_retried: true`, and the log line `progress-only-retried=true`
@@ -718,7 +706,13 @@ are preserved.
 
 ## Retained tool results are using disk
 
-Tool-result compaction can park the exact original bytes of a result it rewrote
+When enabled, tool-result aging can preserve exact textual originals before
+rewriting eligible old results. Local omission requires verified readback access
+for the same conversation/permission scope. Missing or invalid access proofs and
+failed archive writes keep the full result in the request. See the
+[Codex archive guide](CODEX.md#tool-result-aging-and-exact-archive-readback).
+
+The exact textual original is stored
 in `<state dir>/retained-tool-results`. That store is owner-only, is excluded
 from support bundles, and is bounded rather than evicting — at its cap it stops
 accepting new results and eligible results pass through uncompacted.
@@ -734,12 +728,14 @@ of the oldest entry, and the TTL. To empty it:
 Without `--yes` nothing is deleted. The purge removes only files the store
 itself wrote, only inside that one directory, and refuses to follow a symlink
 out of it; anything else that ends up there is reported and left alone. Deleting
-retained bytes is not reversible — a compacted result in an open session keeps
-its hash and head/tail evidence, but the original is gone.
+retained bytes is not reversible. Open sessions can retain archive handles,
+but those handles cannot recover a deleted original. The local reader must
+report it as unavailable historical evidence; rerunning the source command
+would create a new observation, not recover the old one.
 
-Retained results expire after 7 days by default, so most stores never need a
-purge at all. Nothing sweeps on a timer: entries expire when the store is next
-written to. On an install where compaction is off, or one that filled before the
+Retained results expire after 7 days by default. Reads reject expired evidence
+even when its file has not yet been removed. Nothing sweeps on a timer:
+entries expire when the store is next written to. On an install where compaction is off, or one that filled before the
 TTL existed, nothing is going to write again — run the sweep by hand:
 
 ```sh
@@ -757,7 +753,8 @@ not stop expiry.
 
 ## Uninstall retained files
 
-This is intentional. `./bin/uninstall` removes only the active integration and
-background service. The state directory may contain credentials, logs, catalog
+This is intentional. `./bin/uninstall` removes the selected integration and
+retires the shared background service only when no installed client still
+uses it. The state directory may contain credentials, logs, catalog
 caches, install history, and rollback snapshots. Inspect it manually before
 deleting anything.

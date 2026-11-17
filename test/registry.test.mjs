@@ -115,6 +115,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "deepseek/deepseek-v4-flash-vision-exp",
       "deepseek/deepseek-v4-pro",
       "deepseek/deepseek-v4.1-flash",
+      "free/auto",
       "grok-api/grok-4.5",
       "grok-api/grok-4.7",
       "grok-oauth/grok-4.5",
@@ -125,11 +126,13 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "kimi-oauth/k3",
       "kimi-oauth/kimi-for-coding-highspeed",
       "kimi-oauth/kimi-for-coding",
+      "meta/muse-ember-1.0",
       "meta/muse-spark-1.1",
       "meta/muse-spark-1.2-contributor",
       "meta/muse-spark-1.2",
       "meta/muse-spark-1.3-contributor",
       "meta/muse-spark-1.3",
+      "meta/muse-wonder-1.0",
       "minimax-token-plan/minimax-m3",
       "nano-gpt/tencent/hy4-preview",
       "nousresearch/claude-fable-5.1",
@@ -179,6 +182,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "ollama-cloud/kimi-k2.7-code",
       "ollama-cloud/kimi-k3",
       "ollama-cloud/minimax-m3",
+      "opencode-go/beam-free",
       "opencode-go/deepseek-v4-flash-vision-exp",
       "opencode-go/deepseek-v4-flash",
       "opencode-go/deepseek-v4-pro",
@@ -195,10 +199,12 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "opencode-go/kimi-k2.7-code",
       "opencode-go/kimi-k3",
       "opencode-go/longcat-2.0",
+      "opencode-go/longcat-2.5-preview-free",
       "opencode-go/mimo-v2.5-pro",
       "opencode-go/mimo-v2.5",
       "opencode-go/mimo-v2.6-flash",
       "opencode-go/mimo-v2.6-pro",
+      "opencode-go/minimax-m3.1-flash-free",
       "opencode-go/qwen3.5-plus",
       "opencode-go-messages/minimax-m2.5",
       "opencode-go-messages/minimax-m2.7",
@@ -475,12 +481,12 @@ test("provider registry exposes configured API and OAuth model families", () => 
   const opencodeFree = PROVIDERS.get("opencode-free");
   const opencodeFreeResponses = PROVIDERS.get("opencode-free-responses");
   assert.equal(opencodeFree.authMode, "anonymous");
-  assert.equal(opencodeFree.baseUrl, "https://opencode.ai/zen/v1");
+  assert.equal(opencodeFree.baseUrl, "https://opencode.ai/inference/v1");
   assert.equal(opencodeFree.credential, undefined);
   assert.equal(opencodeFreeResponses.variantOf, "opencode-free");
   assert.equal(opencodeFreeResponses.protocol, "openai-responses");
   assert.equal(opencodeFreeResponses.authMode, "anonymous");
-  assert.equal(opencodeFreeResponses.baseUrl, "https://opencode.ai/zen/v1");
+  assert.equal(opencodeFreeResponses.baseUrl, "https://opencode.ai/inference/v1");
   assert.equal(opencodeFreeResponses.baseUrlEnv, undefined);
   assert.equal(opencodeFreeResponses.credential, undefined);
   assert.equal(opencodeFreeResponses.anonymousModelPolicy, "explicit-models");

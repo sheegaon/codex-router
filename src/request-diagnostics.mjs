@@ -125,14 +125,28 @@ export function serviceTierMetadata({
   };
 }
 
+const FREE_POOL_REASONS = new Set([
+  "free_quota",
+  "rate_limited",
+  "payment_required",
+  "refused_anonymous",
+  "model_unavailable",
+  "timeout_or_transport",
+  "upstream_error",
+  "exhausted",
+]);
+
 export function usageDiagnosticMetadata({
   requestId,
+  requestKind,
   contextBytes,
   grokStructuredPatch,
   requestedServiceTier,
   reasoningEffort,
   providerToolCount,
   providerToolSchemaBytes,
+  freePool,
+  freePoolReason,
 } = {}) {
   const safeRequestId = safeDiagnosticRequestId(requestId);
   const safeContextBytes = sanitizeContextBytes(contextBytes);
@@ -143,10 +157,16 @@ export function usageDiagnosticMetadata({
   return {
     ...serviceTierMetadata({ requestedServiceTier }),
     ...(safeRequestId ? { requestId: safeRequestId } : {}),
+    ...(["generation", "compaction"].includes(requestKind) ? { requestKind } : {}),
     ...(safeContextBytes ? { contextBytes: safeContextBytes } : {}),
     ...(safeStructuredPatch ? { grokStructuredPatch: safeStructuredPatch } : {}),
     ...(safeEffort ? { reasoningEffort: safeEffort } : {}),
     ...(safeToolCount !== undefined ? { providerToolCount: safeToolCount } : {}),
     ...(safeToolSchemaBytes !== undefined ? { providerToolSchemaBytes: safeToolSchemaBytes } : {}),
+    // The free/auto pool this attempt belonged to, and why the pool moved on
+    // from it. Fixed vocabulary only, so a ledger row never carries upstream
+    // text.
+    ...(freePool === "free/auto" ? { freePool } : {}),
+    ...(FREE_POOL_REASONS.has(freePoolReason) ? { freePoolReason } : {}),
   };
 }

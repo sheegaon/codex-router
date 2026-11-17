@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { privateFileIsProtected } from "../src/file-security.mjs";
 import { refreshCodexCallerCapabilityContents } from "../src/caller-key-client-refresh.mjs";
-import { CODEX_PATCH_HOOK_BASE_PATH } from "../src/codex-patch-hook-endpoint.mjs";
+import { CODEX_PATCH_HOOK_BASE_PATH, CODEX_PATCH_FEEDBACK_BASE_PATH } from "../src/codex-patch-hook-endpoint.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const manager = path.join(root, "src", "config-manager.mjs");
@@ -112,9 +112,17 @@ function run(
 
 function runWithBlockedAtomicWrite(command, codexHome, stateDir) {
   const driver = `
-import { mkdirSync } from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 process.argv = [process.execPath, ${JSON.stringify(manager)}, ${JSON.stringify(command)}];
-mkdirSync(${JSON.stringify(path.join(codexHome, "config.toml.tmp."))} + process.pid);
+const rename = fs.renameSync;
+fs.renameSync = (temporary, target) => {
+  if (target === ${JSON.stringify(path.join(codexHome, "config.toml"))}) {
+    throw new Error("injected config publication failure");
+  }
+  return rename(temporary, target);
+};
+syncBuiltinESMExports();
 await import(${JSON.stringify(pathToFileURL(manager).href)} + "?blocked-write=" + process.pid);
 `;
   return execFileSync(
@@ -135,7 +143,7 @@ await import(${JSON.stringify(pathToFileURL(manager).href)} + "?blocked-write=" 
   );
 }
 
-test("explicit hook endpoint survives enable and caller refresh; disable preserves user features", () => {
+for (const capabilityBase of [CODEX_PATCH_HOOK_BASE_PATH, CODEX_PATCH_FEEDBACK_BASE_PATH]) test(`explicit ${capabilityBase} endpoint survives refresh and disable`, () => {
   const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-hook-config-"));
   const stateDir = path.join(codexHome, "router-state");
   const configPath = path.join(codexHome, "config.toml");
@@ -144,21 +152,21 @@ test("explicit hook endpoint survives enable and caller refresh; disable preserv
     writeFileSync(configPath, original, { mode: 0o600 });
     run("enable", codexHome, stateDir);
     const activated = refreshCodexCallerCapabilityContents(readFileSync(configPath, "utf8"),
-      `http://127.0.0.1:46192${CODEX_PATCH_HOOK_BASE_PATH}`, { port: 46192 });
+      `http://127.0.0.1:46192${capabilityBase}`, { port: 46192 });
     writeFileSync(configPath, activated, { mode: 0o600 });
     assert.equal(run("status", codexHome, stateDir).mode, "router");
     run("enable", codexHome, stateDir);
     assert.equal(readFileSync(configPath, "utf8"), activated);
     run("caller-capability-refresh", codexHome, stateDir);
     assert.equal(readFileSync(configPath, "utf8"), activated);
-    const legacyBase = `http://127.0.0.1:4102/_codex-router/${CALLER_KEY}${CODEX_PATCH_HOOK_BASE_PATH}`;
-    const legacy = activated.replaceAll(`http://127.0.0.1:46192${CODEX_PATCH_HOOK_BASE_PATH}`, legacyBase);
+    const legacyBase = `http://127.0.0.1:4102/_codex-router/${CALLER_KEY}${capabilityBase}`;
+    const legacy = activated.replaceAll(`http://127.0.0.1:46192${capabilityBase}`, legacyBase);
     writeFileSync(configPath, legacy, { mode: 0o600 });
     run("caller-capability-refresh", codexHome, stateDir);
     assert.equal(readFileSync(configPath, "utf8"), activated);
     run("disable", codexHome, stateDir);
     const disabled = readFileSync(configPath, "utf8");
-    assert.equal(disabled.includes(CODEX_PATCH_HOOK_BASE_PATH), false);
+    assert.equal(disabled.includes(capabilityBase), false);
     assert.match(disabled, /hooks = true/);
     assert.match(disabled, /model = "gpt-5.6-sol"/);
   } finally {
@@ -453,7 +461,8 @@ test("config manager keeps writing the agents scalar when the codex binary lacks
 test("config manager enables multi_agent_v2 and skips the legacy agents scalar when supported", () => {
   const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-v2-feature-"));
   const configPath = path.join(codexHome, "config.toml");
-  writeFileSync(configPath, `model = "gpt-5.5"\n`, { mode: 0o600 });
+  const original = `model = "gpt-5.5"\n`;
+  writeFileSync(configPath, original, { mode: 0o600 });
 
   try {
     run("enable", codexHome);
@@ -476,7 +485,10 @@ test("config manager enables multi_agent_v2 and skips the legacy agents scalar w
     run("disable", codexHome);
     const restored = readFileSync(configPath, "utf8");
     assert.doesNotMatch(restored, /codex-router-multi-agent-v2-managed|multi_agent_v2/);
-    assert.equal(restored.trimStart(), `model = "gpt-5.5"\n`);
+    // Disabling removes managed values; the empty table needs no cleanup.
+    assert.equal(restored.slice(0, original.length), original);
+    assert.match(restored.slice(original.length), /^\n*\[features\]\n*$/);
+    assert.equal(privateFileIsProtected(configPath), true);
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }
@@ -598,7 +610,10 @@ chatgpt_base_url = "https://chat.example/backend-api/"
     assert.match(enabled, /experimental_realtime_ws_base_url = "wss:\/\/voice\.example\/live"/);
 
     run("disable", codexHome);
-    assert.equal(readFileSync(configPath, "utf8"), original);
+    const restored = readFileSync(configPath, "utf8");
+    assert.equal(restored.slice(0, original.length), original);
+    assert.match(restored.slice(original.length), /^\n*\[features\]\n*$/);
+    assert.equal(privateFileIsProtected(configPath), true);
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }
@@ -607,12 +622,9 @@ chatgpt_base_url = "https://chat.example/backend-api/"
 test("config manager derives native Voice calls from a custom ChatGPT base URL", () => {
   const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-voice-base-"));
   const configPath = path.join(codexHome, "config.toml");
-  writeFileSync(
-    configPath,
-    `chatgpt_base_url = "https://chat.example/backend-api/"
-`,
-    { mode: 0o600 },
-  );
+  const original = `chatgpt_base_url = "https://chat.example/backend-api/"
+`;
+  writeFileSync(configPath, original, { mode: 0o600 });
 
   try {
     run("enable", codexHome);
@@ -623,11 +635,10 @@ test("config manager derives native Voice calls from a custom ChatGPT base URL",
     );
 
     run("disable", codexHome);
-    assert.equal(
-      readFileSync(configPath, "utf8"),
-      `chatgpt_base_url = "https://chat.example/backend-api/"
-`,
-    );
+    const restored = readFileSync(configPath, "utf8");
+    assert.equal(restored.slice(0, original.length), original);
+    assert.match(restored.slice(original.length), /^\n*\[features\]\n*$/);
+    assert.equal(privateFileIsProtected(configPath), true);
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }
@@ -845,10 +856,19 @@ base_url = "https://rollback.invalid/v1"
 
   try {
     run("login-free-enable", codexHome, stateDir, ["deepseek/deepseek-v4-pro"]);
+    // Refresh an owned legacy-port generation so the pending state actually
+    // differs. An already-current state cannot detect an omitted rollback.
+    const state = JSON.parse(readFileSync(providerModePath, "utf8"));
+    assert.equal(state.managedBaseUrl, "http://127.0.0.1:46192/v1");
+    state.managedBaseUrl = "http://127.0.0.1:4102/v1";
+    writeFileSync(providerModePath, `${JSON.stringify(state, null, 2)}\n`);
+    writeFileSync(configPath, readFileSync(configPath, "utf8").replaceAll(
+      "http://127.0.0.1:46192/v1", state.managedBaseUrl,
+    ));
     const beforeConfig = readFileSync(configPath, "utf8");
     const beforeState = readFileSync(providerModePath, "utf8");
 
-    assert.throws(() => runWithBlockedAtomicWrite("enable", codexHome, stateDir));
+    assert.throws(() => runWithBlockedAtomicWrite("enable", codexHome, stateDir), /injected config publication failure/);
     assert.equal(readFileSync(configPath, "utf8"), beforeConfig);
     assert.equal(
       readFileSync(providerModePath, "utf8"),
@@ -2138,8 +2158,14 @@ ${originalProviderSection}`,
 
     run("login-free-disable", codexHome, stateDir, [], environment);
     const restored = readFileSync(configPath, "utf8");
-    assert.equal(restored, routerBaseline);
-    assert.match(restored, /Authorization = "Bearer REFRESH_LOGIN_FREE_SECRET"/);
+    // This fixture has no multiline strings: only blank table separators may
+    // move after a successful disable. Failure rollback above stays byte-exact.
+    assert.deepEqual(
+      restored.split("\n").filter(Boolean),
+      routerBaseline.split("\n").filter(Boolean),
+    );
+    assert.ok(restored.includes(originalProviderSection), "restore the original provider text byte-for-byte");
+    assert.equal(privateFileIsProtected(configPath), true);
     assert.equal(existsSync(providerModePath), false);
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
@@ -2645,6 +2671,26 @@ test("a multiline model setting is refused without partial deletion", () => {
   try {
     assert.throws(() => run("enable", home), /single-line TOML string/);
     assert.equal(readFileSync(config, "utf8"), contents);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("cleanup preserves empty tables and multiline table examples", () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "router-empty-table-prose-"));
+  const config = path.join(home, "config.toml");
+  const prose = "developer_instructions = '''\n# codex-router-created-agents-table\n[agents]\n[features]\n\n[example]\ntext only\n'''";
+  const contents = `${prose}\nmodel = "gpt-5.6-sol"\n[agents]\n[features]\n`;
+  writeFileSync(config, contents);
+  try {
+    const env = { MODEL_ROUTER_STATE_DIR: path.join(home, "router-state") };
+    run("enable", home, undefined, [], env);
+    assert.ok(readFileSync(config, "utf8").includes(prose));
+    run("disable", home, undefined, [], env);
+    const restored = readFileSync(config, "utf8");
+    assert.ok(restored.includes(prose));
+    assert.match(restored.replace(prose, ""), /\[agents\]\s*\[features\]/);
+    assert.doesNotMatch(restored.replace(prose, ""), /BEGIN codex-router/);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

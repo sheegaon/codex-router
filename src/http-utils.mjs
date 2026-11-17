@@ -618,10 +618,11 @@ export async function readRequestBody(
 // built-in Response helpers buffer first, which lets a provider-controlled
 // error or relay response consume unbounded memory before the caller can
 // reject it. Cancellation releases the upstream stream as soon as the limit
-// is crossed.
+// is crossed. A caller reading only one tee branch can opt out of awaiting
+// cancellation: that promise also waits for the separately owned branch.
 export async function readResponseBody(
   upstream,
-  { maxBytes = MAX_BUFFERED_RESPONSE_BYTES, signal } = {},
+  { maxBytes = MAX_BUFFERED_RESPONSE_BYTES, signal, awaitCancellation = true } = {},
 ) {
   if (!upstream?.body) return Buffer.alloc(0);
   const reader = upstream.body.getReader();
@@ -639,7 +640,6 @@ export async function readResponseBody(
         : new Uint8Array(result.value || []);
       total += chunk.byteLength;
       if (total > limit) {
-        await reader.cancel().catch(() => {});
         const error = new Error(`Upstream response exceeds ${limit} bytes.`);
         error.status = 502;
         error.code = "ERR_UPSTREAM_RESPONSE_TOO_LARGE";
@@ -648,7 +648,8 @@ export async function readResponseBody(
       chunks.push(Buffer.from(chunk));
     }
   } catch (error) {
-    await reader.cancel().catch(() => {});
+    const cancellation = reader.cancel().catch(() => {});
+    if (awaitCancellation) await cancellation;
     throw error;
   } finally {
     reader.releaseLock?.();
@@ -776,16 +777,15 @@ export async function finishResponse(response) {
 // silent corruption this function exists to avoid. Leading newlines are inert
 // when the stream did end cleanly: a blank line with no buffered fields
 // dispatches nothing.
-// `message` lets a caller that diagnosed the failure say so; the code stays
-// fixed, because a diagnosed cause is more detail about this same failure and
-// not a second kind of it. The default wording holds for every caller that
-// reaches here with nothing more specific -- a guessed cause is worse than an
-// honest generic one.
-export function endStreamedResponse(response, { message } = {}) {
+// Transport failures keep their default retryable classification. A caller
+// rejecting unsafe output locally must preserve its diagnostic code and mark
+// the rejection terminal, so a client does not replay the committed generation.
+export function endStreamedResponse(response, { code = "local_router_stream_failed", message, localRejection = false } = {}) {
   if (!response || response.writableEnded || response.destroyed) return;
   writeStreamErrorEvent(response, {
-    code: "local_router_stream_failed",
+    code,
     message: message || "The local router lost the upstream response stream.",
+    localRejection,
   });
   response.end();
 }
@@ -859,7 +859,8 @@ export function requireInternalAuth(request, response, secret) {
   const authorized = secretEqual(
     request.headers.authorization,
     `Bearer ${secret}`,
-  ) || secretEqual(request.headers["x-api-key"], secret);
+  ) || secretEqual(request.headers["x-api-key"], secret)
+    || secretEqual(request.headers["x-goog-api-key"], secret);
   if (!authorized) {
     writeJson(response, 401, {
       error: {

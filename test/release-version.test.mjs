@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { assertBefore } from "./script-order.mjs";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -86,10 +87,7 @@ test("releases are tag-driven and validate every asset before publishing", () =>
   assert.match(release, /select\(\.conclusion == "success"/);
   assert.match(release, /needs: release-preflight/);
   assert.match(release, /needs: \[release-preflight, unified-app, unified-app-macos\]/);
-  assert.ok(
-    release.indexOf("- run: npm test") < release.indexOf("gh release create"),
-    "the release must pass the full test suite before publishing assets",
-  );
+  assertBefore(release, "- run: npm test", "gh release create", "the release must pass the full test suite before publishing assets");
   assert.match(release, /git archive --format=tar\.gz/);
   assert.match(release, /git archive --format=zip/);
   assert.match(release, /name: Unsigned tester app \(\$\{\{ matrix\.platform \}\}\)/);
@@ -143,10 +141,8 @@ test("releases are tag-driven and validate every asset before publishing", () =>
   );
   assert.match(ci, /Smoke the unified macOS app lifecycle/);
   assert.match(ci, /"\$outer" --supervised/);
-  assert.match(ci, /execFileSync\(process\.argv\[1\], \["--query-lifecycle"\]/);
-  assert.match(ci, /timeout: 10000, killSignal: "SIGKILL"/);
-  assert.match(ci, /delete env\.ELECTRON_RUN_AS_NODE/);
-  assert.match(ci, /if ! last_state=\$\(query_lifecycle\); then\s+cat "\$log" >&2 \|\| true\s+return 1/);
+  assert.match(ci, /node scripts\/query-control-center-lifecycle\.mjs/);
+  assert.match(ci, /if ! last_state=\$\(query_lifecycle\); then\s+diagnose_app_launch\s+cat "\$log" >&2 \|\| true\s+return 1/);
   assert.match(ci, /terminate_bundle io\.github\.codex-router\.control-center/);
   assert.match(ci, /terminate_bundle io\.github\.codex-router\.tray/);
   assert.match(ci, /assert_single_outer_host/);
